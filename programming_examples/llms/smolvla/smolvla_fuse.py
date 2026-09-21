@@ -16,6 +16,12 @@ SMOLVLA_FUSE_FA:
 
 import os
 
+# The LayerNorm implementation: the C++ row kernel (layer_norm_rows.cc, ~1.6x
+# faster, same accuracy) unless SMOLVLA_LN_EXT=0 selects the air.api DSL loop.
+LN_EXT = os.environ.get("SMOLVLA_LN_EXT", "1") == "1"
+# Rows one kernel call normalizes; the best point on NPU2 (layer_norm_rows.cc).
+LN_ROWS = 4
+
 FUSE_MODE = os.environ.get("SMOLVLA_FUSE_FA", "1")
 assert FUSE_MODE in ("0", "1", "layer"), (
     f"SMOLVLA_FUSE_FA={FUSE_MODE!r}: expected '0', '1' or 'layer'"

@@ -125,7 +125,7 @@ are on the NPU.
 |---|---|
 | `smolvla_vision_weights.py` | SigLIP config + weight loading from the checkpoint |
 | `smolvla_vision_builders.py` | the two fused multi-launch ELF builders (`vit_ln_qkv`, `vit_o_ffn`) |
-| `smolvla_fuse.py` | the ELF layout switch `SMOLVLA_FUSE_FA` (`1` default: FlashAttention inside `vit_ln_qkv`; `0`: separate `flash_attn` ELF; `layer`: experimental one-ELF layer) |
+| `smolvla_fuse.py` | the ELF layout switch `SMOLVLA_FUSE_FA` and the LayerNorm switch `SMOLVLA_LN_EXT` (`1` default: C++ row kernel `layer_norm/layer_norm_rows.cc`; `0`: the air.api DSL loop). FUSE_FA: (`1` default: FlashAttention inside `vit_ln_qkv`; `0`: separate `flash_attn` ELF; `layer`: experimental one-ELF layer) |
 | `smolvla_vision_encoder.py` | the NPU driver: compiles the kernels, runs the 12 layers |
 | `smolvla_dataset.py` | real observations from a LeRobot dataset, for `INPUT=real` |
 | `smolvla_cpu_helpers.py` | fp32 numpy reference for every vision operation |
