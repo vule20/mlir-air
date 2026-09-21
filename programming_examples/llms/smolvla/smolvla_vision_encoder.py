@@ -31,6 +31,7 @@ NPU kernels driven (all validated at these exact shapes in A3-1..A3-4, registry)
                    tile_m16/tn80, herd 4x4 — the registry's per-shape override)
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -116,13 +117,55 @@ _ATTN_BACKEND_KWARGS = _attn_backend()
 # runtime_loop_tiling_sizes=[2,2] for BD-ID recycling (same as the backbone o_ffn).
 
 
-def _vit_ln_qkv_backend():
+# Opt-in: fold FlashAttention into vit_ln_qkv as its third launch, so a layer is
+# two ELF dispatches (vit_ln_qkv+FA, vit_o_ffn) instead of three. The merged ELF
+# carries a 3-D FA launch next to the 2-D GEMM launches, and one
+# runtime_loop_tiling_sizes vector serves every launch, so it needs a third
+# entry when images are batched. Tiling / pingpong are env-tunable while the
+# right values for the mixed ELF are being found.
+# The tiling vector MUST be all ones once FlashAttention is in the ELF. [2,2,1]
+# fails to compile ("more than one runtime-valued DMA offset"), but [2,1,1] and
+# [1,2,1] compile and then compute the WRONG result (action-chunk cosine 0.20 and
+# 0.50 in `make verify`) -- and look 12-14% faster, which is the tell.
+# "layer" goes further: the whole layer (LN1, QKV, FA, O, residual, LN2, FFN,
+# residual) is ONE ELF of 9 launches, one dispatch per layer.
+_FUSE_MODE = os.environ.get("SMOLVLA_FUSE_FA", "0")
+_FUSE_LAYER = _FUSE_MODE == "layer"
+_FUSE_FA = _FUSE_MODE in ("1", "layer")
+
+
+def _fa_tiling(n_images):
+    tiling = os.environ.get("SMOLVLA_FA_TILING", "1,1,1" if n_images > 1 else "1,1")
+    sizes = [int(t) for t in tiling.split(",")]
+    assert all(t == 1 for t in sizes), (
+        f"SMOLVLA_FA_TILING={tiling}: a tiled runtime loop miscompiles the "
+        "FlashAttention launch (wrong output, no error); use all ones"
+    )
+    return sizes
+
+
+def _vit_layer_backend(n_images=1):
+    tiling = ",".join(str(t) for t in _fa_tiling(n_images))
     return {
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": "vit_layer",
+        "runtime_loop_tiling_sizes": [int(t) for t in tiling.split(",")],
+        "omit_pingpong": os.environ.get("SMOLVLA_FA_PINGPONG", ""),
+    }
+
+
+def _vit_ln_qkv_backend(n_images=1):
+    kw = {
         "omit_while_true_loop": False,
         "output_format": "elf",
         "instance_name": "vit_ln_qkv",
         "runtime_loop_tiling_sizes": [2, 2],
     }
+    if _FUSE_FA:
+        kw["runtime_loop_tiling_sizes"] = _fa_tiling(n_images)
+        kw["omit_pingpong"] = os.environ.get("SMOLVLA_FA_PINGPONG", "")
+    return kw
 
 
 def _vit_o_ffn_backend():
@@ -340,23 +383,56 @@ def _compile_fused_kernels(
             out_name=s["obj"],
         )
 
-    print(f"  Compiling vit_ln_qkv (2-launch fused ELF, M={batch_len})...")
-    cache.compile_and_cache(
-        "vit_ln_qkv",
-        build_vit_ln_qkv_module(
-            batch_len, emb_dim, n_heads, head_dim, registry_seq_len=seq_len
-        ),
-        {"verbose": cache.verbose, **_vit_ln_qkv_backend()},
-    )
+    if _FUSE_LAYER:
+        from shared.infra.external_kernels import compile_attn_npu2
+        from smolvla_vision_builders import build_vit_layer_module
 
-    print(f"  Compiling vit_o_ffn (6-launch fused ELF, M={batch_len})...")
-    cache.compile_and_cache(
-        "vit_o_ffn",
-        build_vit_o_ffn_module(
-            batch_len, emb_dim, hidden_dim, registry_seq_len=seq_len
-        ),
-        {"verbose": cache.verbose, **_vit_o_ffn_backend()},
-    )
+        compile_attn_npu2(head_dim=head_dim, bfp16=fa_bfp16, force=True)
+        print(f"  Compiling vit_layer (9-launch, one-ELF layer, M={batch_len})...")
+        cache.compile_and_cache(
+            "vit_layer",
+            build_vit_layer_module(
+                batch_len,
+                emb_dim,
+                n_heads,
+                head_dim,
+                hidden_dim,
+                n_images,
+                registry_seq_len=seq_len,
+            ),
+            {"verbose": cache.verbose, **_vit_layer_backend(n_images)},
+        )
+    elif _FUSE_FA:
+        # The merged ELF links attn_npu2.o; it must be compiled before
+        # compile_and_cache stages the CWD's .o files into air_project/.
+        from shared.infra.external_kernels import compile_attn_npu2
+
+        compile_attn_npu2(head_dim=head_dim, bfp16=fa_bfp16, force=True)
+        print(f"  Compiling vit_ln_qkv+flash_attn (3-launch fused ELF, M={batch_len})...")
+    else:
+        print(f"  Compiling vit_ln_qkv (2-launch fused ELF, M={batch_len})...")
+    if not _FUSE_LAYER:
+        cache.compile_and_cache(
+            "vit_ln_qkv",
+            build_vit_ln_qkv_module(
+                batch_len,
+                emb_dim,
+                n_heads,
+                head_dim,
+                registry_seq_len=seq_len,
+                fuse_fa_images=n_images if _FUSE_FA else None,
+            ),
+            {"verbose": cache.verbose, **_vit_ln_qkv_backend(n_images)},
+        )
+
+        print(f"  Compiling vit_o_ffn (6-launch fused ELF, M={batch_len})...")
+        cache.compile_and_cache(
+            "vit_o_ffn",
+            build_vit_o_ffn_module(
+                batch_len, emb_dim, hidden_dim, registry_seq_len=seq_len
+            ),
+            {"verbose": cache.verbose, **_vit_o_ffn_backend()},
+        )
 
     # Standalone affine LayerNorm ELF — used ONCE at the end of the stack for
     # post_layernorm (kept on NPU, identical to the unfused path so post_ln
@@ -372,9 +448,10 @@ def _compile_fused_kernels(
 
     # Fused path only: vit_ln_qkv emits Q|K|V column-concatenated, so FA reads
     # them out of that one buffer instead of three copied-apart ones.
-    _compile_flash_attn(
-        cache, config, seq_len, fa_bfp16, fused_qkv=True, n_images=n_images
-    )
+    if not _FUSE_FA:  # FA rides a fused ELF in both fused modes
+        _compile_flash_attn(
+            cache, config, seq_len, fa_bfp16, fused_qkv=True, n_images=n_images
+        )
 
     if with_connector:
         _compile_connector_gemm(cache)
@@ -699,6 +776,94 @@ def _run_flash_attention(cache, q, k, v, config, seq_len):
 # ---------------------------------------------------------------------------
 
 
+def _run_vit_layer_fused(x_bf16, lw, config, cache, layer_idx, n_images):
+    """One SigLIP layer as ONE dispatch of the 9-launch vit_layer ELF.
+
+    Same math and weight packing as run_vit_block_fused's two ELFs; the args are
+    those of build_vit_layer_module (16 of them). Weight/param BOs are uploaded
+    once per layer; everything else is an intermediate the kernel overwrites.
+    """
+    from shared.builders.gemm_builder import (
+        disambiguate_by_tile_n,
+        gemm_registry_config,
+        repack_gemm_b_with_bias,
+    )
+
+    seq_len = x_bf16.shape[0]
+    assert seq_len % n_images == 0, (seq_len, n_images)
+    reg_len = seq_len // n_images
+    emb, hidden = config.emb_dim, config.hidden_dim
+
+    _cache = getattr(_run_vit_layer_fused, "_arg_cache", {})
+    _run_vit_layer_fused._arg_cache = _cache
+    key = f"vit_layer_L{layer_idx}"
+    if key not in _cache:
+
+        def _pack(w, b):
+            return np.concatenate(
+                [np.asarray(w, dtype=bfloat16), np.asarray(b, dtype=bfloat16)]
+            ).astype(bfloat16)
+
+        def z2(cols):
+            return np.zeros((seq_len, cols), dtype=bfloat16)
+
+        tk1 = gemm_registry_config(reg_len, emb, emb, "bf16", "high")["tile_k_l1"]
+        _o, _g, _d = disambiguate_by_tile_n(
+            [
+                dict(gemm_registry_config(reg_len, emb, emb, "bf16", "high")),
+                dict(gemm_registry_config(reg_len, emb, hidden, "bf16", "high")),
+                dict(gemm_registry_config(reg_len, hidden, emb, "bf16", "high")),
+            ]
+        )
+
+        def _wb(w, b, rows, cols, k1):
+            return repack_gemm_b_with_bias(
+                np.asarray(w, dtype=bfloat16).reshape(rows, cols),
+                np.asarray(b, dtype=bfloat16).reshape(cols),
+                k1,
+            )
+
+        wqkv = np.ascontiguousarray(
+            np.hstack(
+                [
+                    _wb(lw.wq, lw.bq, emb, emb, tk1),
+                    _wb(lw.wk, lw.bk, emb, emb, tk1),
+                    _wb(lw.wv, lw.bv, emb, emb, tk1),
+                ]
+            )
+        )
+        _cache[key] = [
+            None,  # 0  x_in (dynamic)
+            _pack(lw.ln1_w, lw.ln1_b),  # 1  LN1 param
+            z2(emb),  # 2  normed
+            wqkv,  # 3  [Wq|Wk|Wv] + bias
+            z2(3 * emb),  # 4  qkv
+            z2(emb),  # 5  attn
+            _wb(lw.wo, lw.bo, emb, emb, _o["tile_k_l1"]),  # 6  O weight+bias
+            z2(emb),  # 7  o_b
+            z2(emb),  # 8  res1
+            _pack(lw.ln2_w, lw.ln2_b),  # 9  LN2 param
+            z2(emb),  # 10 normed2
+            _wb(lw.w_fc1, lw.b_fc1, emb, hidden, _g["tile_k_l1"]),  # 11 fc1
+            z2(hidden),  # 12 gelu_out
+            _wb(lw.w_fc2, lw.b_fc2, hidden, emb, _d["tile_k_l1"]),  # 13 fc2
+            z2(emb),  # 14 fc2_b
+            z2(emb),  # 15 output
+        ]
+    args = _cache[key]
+    args[0] = np.ascontiguousarray(np.asarray(x_bf16, dtype=bfloat16)).reshape(-1)
+    res = cache.load_and_run(
+        "vit_layer",
+        _vit_layer_backend(n_images),
+        *args,
+        output_indices=[15],
+        static_input_indices={1, 3, 6, 9, 11, 13},  # params + bias-packed weights
+        intermediate_indices={2, 4, 5, 7, 8, 10, 12, 14, 15},
+        bo_key=key,
+    )
+    return res[15].reshape(seq_len, emb)
+
+
 def run_vit_block_fused(
     x_bf16,
     lw,
@@ -720,6 +885,9 @@ def run_vit_block_fused(
 
     attn_mode: "flash" (default) = FlashAttention ELF. "cpu" = host MHA (diag).
     """
+    if _FUSE_LAYER and attn_mode != "cpu":
+        return _run_vit_layer_fused(x_bf16, lw, config, cache, layer_idx, n_images)
+
     seq_len = x_bf16.shape[0]
     assert seq_len % n_images == 0, (seq_len, n_images)
     reg_len = seq_len // n_images
@@ -742,7 +910,8 @@ def run_vit_block_fused(
     # ---- 1. vit_ln_qkv: LN1 + Q/K/V GEMM (bias fused) -> q_b, k_b, v_b ----
     # The Q/K/V bias rides the weight stream, so there are no bias args and no
     # separate bias-add launches; the drain herd folds it into the epilogue cast.
-    ln_key = f"vit_ln_qkv_L{layer_idx}"
+    fuse_fa = _FUSE_FA and attn_mode != "cpu"
+    ln_key = f"vit_ln_qkv_L{layer_idx}" + ("_fa" if fuse_fa else "")
     if ln_key not in _cache:
         from shared.builders.gemm_builder import (
             gemm_registry_config,
@@ -772,21 +941,27 @@ def run_vit_block_fused(
             ),
             z2(3 * emb),  # arg4 [Q|K|V] (out)
         ]
+        if fuse_fa:
+            _cache[ln_key].append(z2(emb))  # arg5 attn (FA out)
     ln_args = _cache[ln_key]
     ln_args[0] = np.ascontiguousarray(np.asarray(x_bf16, dtype=bfloat16)).reshape(-1)
     res = cache.load_and_run(
         "vit_ln_qkv",
-        _vit_ln_qkv_backend(),
+        _vit_ln_qkv_backend(n_images),
         *ln_args,
-        output_indices=[4],
+        output_indices=[5] if fuse_fa else [4],
         static_input_indices={1, 3},  # LN param + bias-packed weights
-        intermediate_indices={2, 4},  # scratch + output
+        # scratch + qkv (+ FA out when FA rides this ELF)
+        intermediate_indices={2, 4, 5} if fuse_fa else {2, 4},
         bo_key=ln_key,
     )
-    qkv = res[4].reshape(seq_len, 3 * emb)
 
     # ---- 2. Attention ----
-    if attn_mode == "cpu":
+    if fuse_fa:
+        # FlashAttention already ran as the third launch of vit_ln_qkv.
+        attn = res[5].reshape(seq_len, emb)
+    elif attn_mode == "cpu":
+        qkv = res[4].reshape(seq_len, 3 * emb)
         from smolvla_cpu_helpers import mha_bidirectional
 
         attn = mha_bidirectional(
@@ -801,6 +976,7 @@ def run_vit_block_fused(
         # Attention is per-image (no cross-image attention), but the images
         # ride a third launch axis inside ONE dispatch rather than a dispatch
         # each -- FA's per-launch cost is ~776 us, its per-iteration cost ~74.
+        qkv = res[4].reshape(seq_len, 3 * emb)
         attn = _run_flash_attention_fused(
             cache, qkv, config, reg_len, n_images=n_images
         )

@@ -232,8 +232,81 @@ def _gemm_tiles(spec):
 # ===========================================================================
 
 
+def _build_flash_attn_ir(seq_per_image, n_images, n_heads, head_dim):
+    """The SigLIP FlashAttention module as text (fused Q|K|V input), plus the
+    external kernel symbols it links from attn_npu2.o.
+
+    Same call as smolvla_vision_encoder._compile_flash_attn, so the stitched launch
+    is the standalone flash_attn ELF's launch. Its func is
+    (qkv (n_images*seq, 3*emb), out (n_images*seq, emb)).
+    """
+    import re
+    from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import (
+        build_module as build_attn,
+    )
+
+    ir = str(
+        build_attn(
+            lk=seq_per_image,
+            lkp=head_dim,
+            lq=seq_per_image,
+            lqp=256,
+            dk=head_dim,
+            dv=head_dim,
+            num_q_tiles=4,
+            num_cascade_stages=4,
+            num_heads=n_heads,
+            num_kv_heads=n_heads,
+            causal=False,
+            num_heads_per_unroll=2,
+            fused_qkv=True,
+            n_images=n_images,
+        )
+    )
+    externs = set(re.findall(r"func\.func private (@\w+)", ir))
+    return ir, externs
+
+
 def build_vit_ln_qkv_module(
-    seq_len, emb_dim, n_heads, head_dim, herd_m=8, herd_n=4, registry_seq_len=None
+    seq_len,
+    emb_dim,
+    n_heads,
+    head_dim,
+    herd_m=8,
+    herd_n=4,
+    registry_seq_len=None,
+    fuse_fa_images=None,
+):
+    """vit_ln_qkv as its own ELF (see _vit_ln_qkv_parts for the args)."""
+    base_args, slices = _vit_ln_qkv_parts(
+        seq_len,
+        emb_dim,
+        n_heads,
+        head_dim,
+        herd_m,
+        herd_n,
+        registry_seq_len,
+        fuse_fa_images,
+    )
+    module = stitch_elf(
+        "vit_ln_qkv",
+        base_args,
+        slices,
+        debug_dump_path="/tmp/debug_vit_ln_qkv.mlir",
+    )
+    print(f"  vit_ln_qkv module: {len(str(module).splitlines())} lines, parsed OK")
+    return module
+
+
+def _vit_ln_qkv_parts(
+    seq_len,
+    emb_dim,
+    n_heads,
+    head_dim,
+    herd_m=8,
+    herd_n=4,
+    registry_seq_len=None,
+    fuse_fa_images=None,
 ):
     """Fused LN1 + Q/K/V GEMM + per-channel Q/K/V bias-add for one SigLIP block.
 
@@ -255,6 +328,10 @@ def build_vit_ln_qkv_module(
         cloned inline at every launch) while a launch ITERATION costs ~13 us.
     FlashAttention reads Q/K/V straight out of the concatenated buffer
     (`fused_qkv=True`), so nothing is copied apart to feed it.
+
+    fuse_fa_images: when not None, FlashAttention becomes a third launch of this
+    ELF (over that many stacked images) and the func gains
+      %arg5  attn     (seq, emb)            FA out (intermediate; feeds vit_o_ffn)
     """
     # The registry is keyed by MEASURED shapes, and GEMM tiles do not depend on
     # M, so a batched (multi-image) build looks the tiles up at the per-image
@@ -313,14 +390,16 @@ def build_vit_ln_qkv_module(
         ),
     ]
 
-    module = stitch_elf(
-        "vit_ln_qkv",
-        base_args,
-        slices,
-        debug_dump_path="/tmp/debug_vit_ln_qkv.mlir",
-    )
-    print(f"  vit_ln_qkv module: {len(str(module).splitlines())} lines, parsed OK")
-    return module
+    if fuse_fa_images is not None:
+        assert seq_len % fuse_fa_images == 0, (seq_len, fuse_fa_images)
+        print(f"  [ln_qkv 3/3] FlashAttention ({fuse_fa_images} image(s))...")
+        fa_ir, fa_externs = _build_flash_attn_ir(
+            seq_len // fuse_fa_images, fuse_fa_images, n_heads, head_dim
+        )
+        base_args.append(FuncArg("%arg5", f"memref<{seq_len}x{emb_dim}xbf16>"))
+        slices.append(KernelSlice(fa_ir, "fa", {0: 4, 1: 5}, extern_syms=fa_externs))
+
+    return base_args, slices
 
 
 # ===========================================================================
@@ -331,6 +410,29 @@ def build_vit_ln_qkv_module(
 
 def build_vit_o_ffn_module(
     seq_len, emb_dim, hidden_dim, herd_m=8, herd_n=4, registry_seq_len=None
+):
+    """vit_o_ffn as its own ELF (see _vit_o_ffn_parts for the args)."""
+    base_args, slices = _vit_o_ffn_parts(
+        seq_len, emb_dim, hidden_dim, herd_m, herd_n, registry_seq_len
+    )
+    module = stitch_elf(
+        "vit_o_ffn",
+        base_args,
+        slices,
+        debug_dump_path="/tmp/debug_vit_o_ffn.mlir",
+    )
+    print(f"  vit_o_ffn module: {len(str(module).splitlines())} lines, parsed OK")
+    return module
+
+
+def _vit_o_ffn_parts(
+    seq_len,
+    emb_dim,
+    hidden_dim,
+    herd_m=8,
+    herd_n=4,
+    registry_seq_len=None,
+    amap=None,
 ):
     """Fused O-proj + residual + LN2 + FFN(fc1/GELU/fc2) + residual for one block.
 
@@ -351,7 +453,16 @@ def build_vit_o_ffn_module(
     The three bias-add launches AND the GELU launch are gone: each GEMM carries
     its bias on the weight stream, and fc1 additionally applies GELU, all inside
     the drain herd's epilogue cast.
+
+    Returns (base_args, slices). `amap` ({vit_o_ffn arg idx: combined arg idx})
+    re-wires the slices onto a larger func, which is how build_vit_layer_module
+    embeds these launches after FlashAttention; None keeps the ELF's own indices.
     """
+    amap = amap or {i: i for i in range(12)}
+
+    def M(d):
+        return {k: amap[v] for k, v in d.items()}
+
     reg_len = registry_seq_len or seq_len  # see build_vit_ln_qkv_module
     o_spec = dict(gemm_registry_config(reg_len, emb_dim, emb_dim, "bf16", "high"))
     g_spec = dict(gemm_registry_config(reg_len, emb_dim, hidden_dim, "bf16", "high"))
@@ -450,40 +561,103 @@ def build_vit_o_ffn_module(
         KernelSlice(
             o_ir,
             "o",
-            {0: 0, 1: 1, 2: 2},
+            M({0: 0, 1: 1, 2: 2}),
             extern_syms=_gemm_externs(o_spec, True),
             private_from=_pf(o_spec),
         ),
-        KernelSlice(res1_ir, "r1", {0: 2, 1: 3, 2: 4}, private_from=False),
+        KernelSlice(res1_ir, "r1", M({0: 2, 1: 3, 2: 4}), private_from=False),
         KernelSlice(
             ln2_ir,
             "ln2",
-            {0: 4, 1: 5, 2: 6},
+            M({0: 4, 1: 5, 2: 6}),
             extern_syms={"@zero_vectorized_bf16"},
             private_from=False,
         ),
         KernelSlice(
             fc1_ir,
             "g",
-            {0: 6, 1: 7, 2: 8},
+            M({0: 6, 1: 7, 2: 8}),
             extern_syms=_gemm_externs(g_spec, True, gelu=True),
             private_from=_pf(g_spec),
         ),
         KernelSlice(
             fc2_ir,
             "d",
-            {0: 8, 1: 9, 2: 10},
+            M({0: 8, 1: 9, 2: 10}),
             extern_syms=_gemm_externs(d_spec, True),
             private_from=_pf(d_spec),
         ),
-        KernelSlice(res2_ir, "r2", {0: 10, 1: 4, 2: 11}, private_from=False),
+        KernelSlice(res2_ir, "r2", M({0: 10, 1: 4, 2: 11}), private_from=False),
     ]
 
-    module = stitch_elf(
-        "vit_o_ffn",
-        base_args,
-        slices,
-        debug_dump_path="/tmp/debug_vit_o_ffn.mlir",
+    return base_args, slices
+
+
+# ===========================================================================
+# Whole layer as ONE ELF: LN1 + QKV GEMM + FlashAttention + the o_ffn launches
+# ===========================================================================
+
+
+def build_vit_layer_module(
+    seq_len,
+    emb_dim,
+    n_heads,
+    head_dim,
+    hidden_dim,
+    n_images,
+    herd_m=8,
+    herd_n=4,
+    registry_seq_len=None,
+):
+    """One SigLIP encoder layer as a single multi-launch ELF (9 launches).
+
+    Combined func args:
+      %arg0  x_in      (seq, emb)        block input; also the O-residual
+      %arg1  ln1_param (2*emb,)
+      %arg2  normed    (seq, emb)        LN1 out (intermediate)
+      %arg3  wqkv      (packed_k, 3*emb) [Wq|Wk|Wv], bias-packed
+      %arg4  qkv       (seq, 3*emb)      intermediate
+      %arg5  attn      (seq, emb)        FA out (intermediate)
+      %arg6  wo        (packed_k, emb)   O weight, bias-packed
+      %arg7  o_b       (seq, emb)        intermediate
+      %arg8  res1      (seq, emb)        o_b + x_in (intermediate)
+      %arg9  ln2_param (2*emb,)
+      %arg10 normed2   (seq, emb)        intermediate
+      %arg11 w_fc1     (packed_k, hidden)
+      %arg12 gelu_out  (seq, hidden)     intermediate
+      %arg13 w_fc2     (packed_k, emb)
+      %arg14 fc2_b     (seq, emb)        intermediate
+      %arg15 output    (seq, emb)        fc2_b + res1
+
+    The o_ffn residual input is %arg0 itself, so the separate x_res buffer of the
+    standalone vit_o_ffn ELF disappears.
+    """
+    base_args, slices = _vit_ln_qkv_parts(
+        seq_len,
+        emb_dim,
+        n_heads,
+        head_dim,
+        herd_m,
+        herd_n,
+        registry_seq_len,
+        fuse_fa_images=n_images,
     )
-    print(f"  vit_o_ffn module: {len(str(module).splitlines())} lines, parsed OK")
+    # vit_o_ffn arg idx -> combined arg idx (x_res IS the block input, arg0)
+    amap = {0: 5, 1: 6, 2: 7, 3: 0, 4: 8, 5: 9, 6: 10, 7: 11, 8: 12, 9: 13,
+            10: 14, 11: 15}
+    o_args, o_slices = _vit_o_ffn_parts(
+        seq_len, emb_dim, hidden_dim, herd_m, herd_n, registry_seq_len, amap=amap
+    )
+    # o_ffn's own arg types, at their combined positions (arg3 = x_res is dropped;
+    # arg0 attn is already combined arg5).
+    for oi in (1, 2, 4, 5, 6, 7, 8, 9, 10, 11):
+        base_args.append(FuncArg(f"%arg{amap[oi]}", o_args[oi].type))
+    base_args.sort(key=lambda a: int(a.name[4:]))
+    module = stitch_elf(
+        "vit_layer",
+        base_args,
+        slices + o_slices,
+        debug_dump_path="/tmp/debug_vit_layer.mlir",
+    )
+    print(f"  vit_layer module: {len(str(module).splitlines())} lines, parsed OK")
     return module

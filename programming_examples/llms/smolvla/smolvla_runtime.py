@@ -51,7 +51,13 @@ MODEL_ID = "lerobot/smolvla_base"
 # Resolved against THIS FILE, not the cwd: VisionRuntime is imported into
 # lerobot's process, so where it finds its ELFs must not depend on who called
 # it. Under build/ so that `make clean` is `rm -rf build/` and nothing else.
-VISION_CACHE_DIR = str(_HERE / "build" / "vision_kernel_cache")
+# SMOLVLA_FUSE_FA (see smolvla_vision_encoder): "1" folds FlashAttention into
+# vit_ln_qkv, "layer" makes the whole layer one ELF. Each mode compiles a
+# different ELF set, so each gets its own cache dir; the default keeps the
+# original path.
+_FUSE_MODE = os.environ.get("SMOLVLA_FUSE_FA", "0")
+_CACHE_SUFFIX = {"1": "_fa", "layer": "_layer"}.get(_FUSE_MODE, "")
+VISION_CACHE_DIR = str(_HERE / "build" / f"vision_kernel_cache{_CACHE_SUFFIX}")
 VISION_SEQ_LEN = 1024
 # SmolVLA feeds 3 camera images per step, and every op except attention is
 # row-independent, so all 3 run stacked along rows through the two fused ELFs.
@@ -61,13 +67,20 @@ VISION_SEQ_LEN = 1024
 # patch embedding and discarding the extra rows; more than this many images
 # asserts, because it would need a differently-sized ELF.
 VISION_N_IMAGES = 3
-VISION_KERNELS = {
-    "vit_ln_qkv",
-    "vit_o_ffn",
-    "flash_attn",
-    "layer_norm",
-    "gemm_connector",
-}
+# The cache holds only the ELFs the chosen mode compiles, so the expected set has
+# to follow it.
+if _FUSE_MODE == "layer":
+    VISION_KERNELS = {"vit_layer", "layer_norm", "gemm_connector"}
+elif _FUSE_MODE == "1":
+    VISION_KERNELS = {"vit_ln_qkv", "vit_o_ffn", "layer_norm", "gemm_connector"}
+else:
+    VISION_KERNELS = {
+        "vit_ln_qkv",
+        "vit_o_ffn",
+        "flash_attn",
+        "layer_norm",
+        "gemm_connector",
+    }
 
 
 # ---------------------------------------------------------------------------
