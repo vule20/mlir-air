@@ -47,6 +47,7 @@ _LLMS_DIR = str(Path(__file__).resolve().parent.parent)
 if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
+from smolvla_fuse import FUSE_MODE
 from smolvla_vision_weights import SigLIPVisionConfig
 from smolvla_cpu_helpers import im2col_patch_embed
 from shared.infra.cache import KernelCache, Profiler  # noqa: F401 (re-exported)
@@ -117,8 +118,9 @@ _ATTN_BACKEND_KWARGS = _attn_backend()
 # runtime_loop_tiling_sizes=[2,2] for BD-ID recycling (same as the backbone o_ffn).
 
 
-# Opt-in: fold FlashAttention into vit_ln_qkv as its third launch, so a layer is
-# two ELF dispatches (vit_ln_qkv+FA, vit_o_ffn) instead of three. The merged ELF
+# FlashAttention is folded into vit_ln_qkv as its third launch by default (see
+# smolvla_fuse), so a layer is two ELF dispatches (vit_ln_qkv+FA, vit_o_ffn)
+# instead of three; SMOLVLA_FUSE_FA=0 restores the three-ELF layout. The merged ELF
 # carries a 3-D FA launch next to the 2-D GEMM launches, and one
 # runtime_loop_tiling_sizes vector serves every launch, so it needs a third
 # entry when images are batched. Tiling / pingpong are env-tunable while the
@@ -129,7 +131,7 @@ _ATTN_BACKEND_KWARGS = _attn_backend()
 # 0.50 in `make verify`) -- and look 12-14% faster, which is the tell.
 # "layer" goes further: the whole layer (LN1, QKV, FA, O, residual, LN2, FFN,
 # residual) is ONE ELF of 9 launches, one dispatch per layer.
-_FUSE_MODE = os.environ.get("SMOLVLA_FUSE_FA", "0")
+_FUSE_MODE = FUSE_MODE
 _FUSE_LAYER = _FUSE_MODE == "layer"
 _FUSE_FA = _FUSE_MODE in ("1", "layer")
 

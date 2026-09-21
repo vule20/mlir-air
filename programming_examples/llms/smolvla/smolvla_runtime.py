@@ -51,11 +51,10 @@ MODEL_ID = "lerobot/smolvla_base"
 # Resolved against THIS FILE, not the cwd: VisionRuntime is imported into
 # lerobot's process, so where it finds its ELFs must not depend on who called
 # it. Under build/ so that `make clean` is `rm -rf build/` and nothing else.
-# SMOLVLA_FUSE_FA (see smolvla_vision_encoder): "1" folds FlashAttention into
-# vit_ln_qkv, "layer" makes the whole layer one ELF. Each mode compiles a
-# different ELF set, so each gets its own cache dir; the default keeps the
-# original path.
-_FUSE_MODE = os.environ.get("SMOLVLA_FUSE_FA", "0")
+# The ELF layout (smolvla_fuse.FUSE_MODE). Each mode compiles a different ELF
+# set, so each gets its own cache dir; mode "0" keeps the original path.
+from smolvla_fuse import FUSE_MODE as _FUSE_MODE  # noqa: E402
+
 _CACHE_SUFFIX = {"1": "_fa", "layer": "_layer"}.get(_FUSE_MODE, "")
 VISION_CACHE_DIR = str(_HERE / "build" / f"vision_kernel_cache{_CACHE_SUFFIX}")
 VISION_SEQ_LEN = 1024
