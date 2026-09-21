@@ -93,6 +93,12 @@ def _gelu_backend():
     }
 
 
+# SMOLVLA_FA_QSEG=1 runs the FlashAttention q-block loop inside the segment instead of
+# as a launch-grid axis: the same design and microkernels (bit-identical output), but
+# head_groups * n_images sequential waves instead of q_blocks * head_groups * n_images.
+_FA_Q_IN_SEGMENT = os.environ.get("SMOLVLA_FA_QSEG", "0") == "1"
+
+
 def _attn_backend(n_images=1):
     """FlashAttention ELF kwargs. `runtime_loop_tiling_sizes` needs ONE ENTRY
     PER LAUNCH DIMENSION: batching images adds a third axis, and with only two
@@ -270,9 +276,12 @@ def _compile_flash_attn(cache, config, seq_len, fa_bfp16, fused_qkv=False, n_ima
         num_heads_per_unroll=num_heads_per_unroll,
         fused_qkv=fused_qkv,
         n_images=n_images,
+        q_in_segment=_FA_Q_IN_SEGMENT,
     )
     compile_attn_npu2(head_dim=head_dim, bfp16=fa_bfp16, force=True)
-    print(f"    (FA microkernel BFP16={fa_bfp16})")
+    print(
+        f"    (FA microkernel BFP16={fa_bfp16}, q loop in segment={_FA_Q_IN_SEGMENT})"
+    )
     cache.compile_and_cache(
         "flash_attn",
         attn_mod,
@@ -418,7 +427,9 @@ def _compile_fused_kernels(
         from shared.infra.external_kernels import compile_attn_npu2
 
         compile_attn_npu2(head_dim=head_dim, bfp16=fa_bfp16, force=True)
-        print(f"  Compiling vit_ln_qkv+flash_attn (3-launch fused ELF, M={batch_len})...")
+        print(
+            f"  Compiling vit_ln_qkv+flash_attn (3-launch fused ELF, M={batch_len})..."
+        )
     else:
         print(f"  Compiling vit_ln_qkv (2-launch fused ELF, M={batch_len})...")
     if not _FUSE_LAYER:

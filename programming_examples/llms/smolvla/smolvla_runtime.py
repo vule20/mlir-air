@@ -70,6 +70,9 @@ if _OFFN_TILING != [2, 2]:
     _CACHE_SUFFIX += "_o" + "x".join(str(t) for t in _OFFN_TILING)
 if _FUSE_MODE == "0" and _LNQKV_TILING != [2, 2]:
     _CACHE_SUFFIX += "_q" + "x".join(str(t) for t in _LNQKV_TILING)
+# The FlashAttention schedule (q loop inside the segment) is baked into that ELF too.
+if os.environ.get("SMOLVLA_FA_QSEG", "0") == "1":
+    _CACHE_SUFFIX += "_qseg"
 VISION_CACHE_DIR = str(_HERE / "build" / f"vision_kernel_cache{_CACHE_SUFFIX}")
 VISION_SEQ_LEN = 1024
 # SmolVLA feeds 3 camera images per step, and every op except attention is
