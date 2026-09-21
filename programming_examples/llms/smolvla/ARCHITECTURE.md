@@ -43,9 +43,9 @@ and GELU-tanh were promoted into the registry by this work.
 ## Fused ELFs: 18 launches → 3 dispatches
 
 `smolvla_vision_builders.py` stitches the per-layer launches into multi-launch
-ELFs via `shared/infra/stitching.stitch_elf`. By default (`SMOLVLA_FUSE_FA=1`,
-see `smolvla_fuse.py`) FlashAttention is the third launch of `vit_ln_qkv`, so a
-layer is two ELF dispatches; `SMOLVLA_FUSE_FA=0` restores the three ELFs below:
+ELFs via `shared/infra/stitching.stitch_elf`, three per layer as below. (`SMOLVLA_FUSE_FA=1`,
+see `smolvla_fuse.py`, folds `flash_attn` into `vit_ln_qkv` as a third launch; it is
+opt-in because it forces the whole ELF to all-ones loop tiling and comes out slower.):
 
 | ELF | launches | contents |
 |---|---|---|
@@ -76,7 +76,7 @@ warmup_npu()                     once per process, outside any timing
 encode(images)                   per inference
   im2col_patch_embed ×N          host, before the thread clamp
   for each image:
-    12 × [vit_ln_qkv (+ flash_attn) → vit_o_ffn]   (flash_attn is its own ELF only with SMOLVLA_FUSE_FA=0)
+    12 × [vit_ln_qkv → flash_attn → vit_o_ffn]
     post_layernorm
     pixel_shuffle (host) → connector GEMM
   → (N, 64, 960) RAW connector output         ~166 ms/image (earlier session; see docs/profile.md)

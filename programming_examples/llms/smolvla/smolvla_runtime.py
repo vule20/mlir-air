@@ -53,12 +53,23 @@ MODEL_ID = "lerobot/smolvla_base"
 # it. Under build/ so that `make clean` is `rm -rf build/` and nothing else.
 # The ELF layout (smolvla_fuse.FUSE_MODE). Each mode compiles a different ELF
 # set, so each gets its own cache dir; mode "0" keeps the original path.
-from smolvla_fuse import FUSE_MODE as _FUSE_MODE, LN_EXT as _LN_EXT  # noqa: E402
+from smolvla_fuse import (  # noqa: E402
+    FUSE_MODE as _FUSE_MODE,
+    LN_EXT as _LN_EXT,
+    OFFN_TILING as _OFFN_TILING,
+    LNQKV_TILING as _LNQKV_TILING,
+)
 
 # The LayerNorm implementation is baked into the ELFs too, so it is part of the key.
 _CACHE_SUFFIX = {"1": "_fa", "layer": "_layer"}.get(_FUSE_MODE, "") + (
     "_ln" if _LN_EXT else ""
 )
+# ...and so are the tilings (the old value, 2,2, adds nothing to the name). The
+# vit_ln_qkv one only exists when FlashAttention is not merged into that ELF.
+if _OFFN_TILING != [2, 2]:
+    _CACHE_SUFFIX += "_o" + "x".join(str(t) for t in _OFFN_TILING)
+if _FUSE_MODE == "0" and _LNQKV_TILING != [2, 2]:
+    _CACHE_SUFFIX += "_q" + "x".join(str(t) for t in _LNQKV_TILING)
 VISION_CACHE_DIR = str(_HERE / "build" / f"vision_kernel_cache{_CACHE_SUFFIX}")
 VISION_SEQ_LEN = 1024
 # SmolVLA feeds 3 camera images per step, and every op except attention is

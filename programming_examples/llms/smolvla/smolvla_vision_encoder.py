@@ -47,7 +47,7 @@ _LLMS_DIR = str(Path(__file__).resolve().parent.parent)
 if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
-from smolvla_fuse import FUSE_MODE, LN_EXT, LN_ROWS
+from smolvla_fuse import FUSE_MODE, LN_EXT, LN_ROWS, LNQKV_TILING, OFFN_TILING
 from smolvla_vision_weights import SigLIPVisionConfig
 from smolvla_cpu_helpers import im2col_patch_embed
 from shared.infra.cache import KernelCache, Profiler  # noqa: F401 (re-exported)
@@ -118,9 +118,10 @@ _ATTN_BACKEND_KWARGS = _attn_backend()
 # runtime_loop_tiling_sizes=[2,2] for BD-ID recycling (same as the backbone o_ffn).
 
 
-# FlashAttention is folded into vit_ln_qkv as its third launch by default (see
-# smolvla_fuse), so a layer is two ELF dispatches (vit_ln_qkv+FA, vit_o_ffn)
-# instead of three; SMOLVLA_FUSE_FA=0 restores the three-ELF layout. The merged ELF
+# SMOLVLA_FUSE_FA=1 folds FlashAttention into vit_ln_qkv as its third launch, so a
+# layer is two ELF dispatches (vit_ln_qkv+FA, vit_o_ffn) instead of three; the
+# default (0) keeps three ELFs, because the merge costs the GEMMs their loop
+# tiling (see smolvla_fuse). The merged ELF
 # carries a 3-D FA launch next to the 2-D GEMM launches, and one
 # runtime_loop_tiling_sizes vector serves every launch, so it needs a third
 # entry when images are batched. Tiling / pingpong are env-tunable while the
@@ -162,7 +163,7 @@ def _vit_ln_qkv_backend(n_images=1):
         "omit_while_true_loop": False,
         "output_format": "elf",
         "instance_name": "vit_ln_qkv",
-        "runtime_loop_tiling_sizes": [2, 2],
+        "runtime_loop_tiling_sizes": list(LNQKV_TILING),
     }
     if _FUSE_FA:
         kw["runtime_loop_tiling_sizes"] = _fa_tiling(n_images)
@@ -175,7 +176,7 @@ def _vit_o_ffn_backend():
         "omit_while_true_loop": False,
         "output_format": "elf",
         "instance_name": "vit_o_ffn",
-        "runtime_loop_tiling_sizes": [2, 2],
+        "runtime_loop_tiling_sizes": list(OFFN_TILING),
     }
 
 
