@@ -36,6 +36,8 @@ _LLAMA = _LLMS / "llama32_1b"
 for p in (str(_SMOLVLA), str(_LLMS), str(_LLAMA)):
     if p not in sys.path:
         sys.path.insert(0, p)
+if str(_LLMS.parent) not in sys.path:
+    sys.path.append(str(_LLMS.parent))  # flash_attention.*
 
 os.environ.setdefault("SMOLVLA_CPU_BIND", "1")
 os.environ.setdefault("SMOLVLA_CPU_THREADS", "8")
@@ -138,6 +140,27 @@ _MASK_HOLDER = {"mask": None}
 # runtime_loop_tiling_sizes of the fused rms_gemms_rope / o_ffn ELFs, shared by
 # compile and load (main() overrides from --rgr-tiling / --offn-tiling).
 _TILING = {"rgr": [2, 2], "offn": [2, 2]}
+# Additive bf16 (seq, seq) mask for the on-NPU FlashAttention ELF; None keeps
+# attention on the CPU (main() sets it from --npu-attn).
+_NPU_ATTN = {"mask": None}
+# The FA grid is [1, n_heads]: tiling the head dim breaks the K/V DMA strides
+# (13-element stride, not 4-byte aligned) at [x, 5]/[x, 6] and silently
+# miscompiles at [x, 3]; the M dim has trip count 1, so [2, 1] == [1, 1].
+_FA_BACKEND = {"verbose": False, "omit_while_true_loop": False, "output_format": "elf",
+               "instance_name": "attention_bf16", "runtime_loop_tiling_sizes": [2, 1]}
+# Whole-layer ELF: empty global tiling, so each launch's air.shim_dma_tile_sizes applies.
+_LAYER_BACKEND = {"verbose": False, "omit_while_true_loop": False, "output_format": "elf",
+                  "instance_name": "layer", "runtime_loop_tiling_sizes": []}
+
+
+def additive_attn_mask(mask_bool):
+    """bool (True = attend) -> the additive bf16 mask attn_npu2_seqfirst's
+    attn_mask=True expects: 0 where kept, bf16 lowest (0xff7f) where dropped.
+    Lowest rather than -inf keeps fully masked rows finite, reproducing the
+    float32-min reference (such a row averages every key)."""
+    m = np.zeros(mask_bool.shape, np.uint16)
+    m[~mask_bool] = 0xFF7F
+    return m.view(bfloat16)
 
 
 def _patched_attention_reference(q, k, v, n_heads, n_kv_heads):
@@ -220,7 +243,7 @@ def compile_backbone_kernels(
     cache, config, seq_len, herd_m_override=None, fused_gu=False, gu_tile_n=80,
     fused_qkv=False, qkv_tile_n=80, gu_bstationary=False, qkv_bstationary=False,
     od_bstationary=False, od_tile_n=80, o_bstationary=None, dn_bstationary=None, dn_herd_m=None,
-    dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False,
+    dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False, npu_attn=False, fused_layer=False,
 ):
     """Replacement for llama32_1b_prefill.compile_all_kernels: that function
     hardcodes mm.o pre-compiles at tile_n=128 (llama32_1b's own registry
@@ -249,13 +272,14 @@ def compile_backbone_kernels(
     if fused_qkv:
         from rms_gemms_rope_fused_qkv import build_rms_gemms_rope_module_fused_qkv
 
+        rgr_mod = build_rms_gemms_rope_module_fused_qkv(
+            seq_len, config.emb_dim, config.n_kv_heads * config.head_dim,
+            config.n_heads, config.n_kv_heads, config.head_dim, herd_m=gemm_herd_m, qkv_tile_n=qkv_tile_n,
+            b_stationary=qkv_bstationary,
+        )
         cache.compile_and_cache(
             "rms_gemms_rope",
-            build_rms_gemms_rope_module_fused_qkv(
-                seq_len, config.emb_dim, config.n_kv_heads * config.head_dim,
-                config.n_heads, config.n_kv_heads, config.head_dim, herd_m=gemm_herd_m, qkv_tile_n=qkv_tile_n,
-                b_stationary=qkv_bstationary,
-            ),
+            rgr_mod,
             {"verbose": cache.verbose, "omit_while_true_loop": False, "output_format": "elf",
              "instance_name": "rms_gemms_rope_fused_qkv", "runtime_loop_tiling_sizes": _TILING["rgr"]},
         )
@@ -280,21 +304,43 @@ def compile_backbone_kernels(
     if fused_gu:
         from o_ffn_fused_gu import build_o_ffn_module_fused_gu
 
-        cache.compile_and_cache(
-            "o_ffn",
-            build_o_ffn_module_fused_gu(
-                seq_len, config.emb_dim, config.hidden_dim, herd_m=gemm_herd_m, gu_tile_n=gu_tile_n,
-                gu_b_stationary=gu_bstationary, od_b_stationary=od_bstationary, od_tile_n=od_tile_n,
-                o_b_stationary=o_bstationary, dn_b_stationary=dn_bstationary, dn_herd_m=dn_herd_m,
-                dn_tile_m=dn_tile_m, dn_tile_n=dn_tile_n, dup=offn_dup, gu_swiglu=gu_swiglu,
-            ),
-            fused_offn_backend,
+        offn_mod = build_o_ffn_module_fused_gu(
+            seq_len, config.emb_dim, config.hidden_dim, herd_m=gemm_herd_m, gu_tile_n=gu_tile_n,
+            gu_b_stationary=gu_bstationary, od_b_stationary=od_bstationary, od_tile_n=od_tile_n,
+            o_b_stationary=o_bstationary, dn_b_stationary=dn_bstationary, dn_herd_m=dn_herd_m,
+            dn_tile_m=dn_tile_m, dn_tile_n=dn_tile_n, dup=offn_dup, gu_swiglu=gu_swiglu,
         )
+        cache.compile_and_cache("o_ffn", offn_mod, fused_offn_backend)
     else:
         cache.compile_and_cache(
             "o_ffn",
             build_o_ffn_module(seq_len, config.emb_dim, config.hidden_dim, herd_m=gemm_herd_m),
             o_ffn_backend,
+        )
+    if npu_attn:
+        from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import build_module
+        from shared.infra.external_kernels import compile_attn_npu2
+
+        hd = config.head_dim
+        kv_dim = config.n_kv_heads * hd
+        # bfp16=True: the plain bf16 microkernel NaNs at this shape.
+        compile_attn_npu2(head_dim=hd, bfp16=True, force=True)
+        # V is read in place from the fused QKV GEMM output (its last kv_dim columns).
+        fa_mod = build_module(lk=seq_len, lkp=hd, lq=seq_len, lqp=seq_len, dk=hd, dv=hd,
+                              num_q_tiles=seq_len // hd, num_cascade_stages=seq_len // hd,
+                              num_heads=config.n_heads, num_kv_heads=config.n_kv_heads,
+                              num_heads_per_unroll=1, causal=False, attn_mask=True,
+                              v_cols=config.emb_dim + 2 * kv_dim)
+        cache.compile_and_cache("flash_attn", fa_mod, {**_FA_BACKEND, "verbose": cache.verbose})
+    if fused_layer:
+        from layer_fused import build_layer_module
+
+        cache.compile_and_cache(
+            "layer",
+            build_layer_module(str(rgr_mod), str(fa_mod), str(offn_mod),
+                               {"rgr": _TILING["rgr"], "fa": _FA_BACKEND["runtime_loop_tiling_sizes"],
+                                "offn": _TILING["offn"]}),
+            {**_LAYER_BACKEND, "verbose": cache.verbose},
         )
     cache._save_manifest()
     print(f"Backbone kernels compiled and cached to {cache.cache_dir}/")
@@ -391,11 +437,23 @@ def run_transformer_block_custom(
         q_roped = results[11].reshape(seq_len, n_heads * head_dim)
         k_roped = results[12].reshape(seq_len, n_kv_heads * head_dim)
 
-    with cache.profiler.time_cpu("prefill_cpu_attention"):
-        attn_out = prefill.attention_reference(
-            q_roped.astype(np.float32), k_roped.astype(np.float32), v.astype(np.float32),
-            n_heads, n_kv_heads,
-        ).astype(bfloat16)
+    if _NPU_ATTN["mask"] is not None:
+        _fa_key = "flash_attn"
+        if _fa_key not in _arg_cache:
+            _arg_cache[_fa_key] = [None, None, None, _NPU_ATTN["mask"],
+                                   np.zeros((seq_len, emb_dim), dtype=bfloat16)]
+        fa_args = _arg_cache[_fa_key]
+        fa_args[0], fa_args[1], fa_args[2] = q_roped, k_roped, qkv_buf
+        attn_out = cache.load_and_run(
+            "flash_attn", _FA_BACKEND, *fa_args, output_indices=[4], static_input_indices={3},
+            intermediate_indices={4}, bo_key=_fa_key, shared_nonstatic=True,
+        )[4].reshape(seq_len, emb_dim)
+    else:
+        with cache.profiler.time_cpu("prefill_cpu_attention"):
+            attn_out = prefill.attention_reference(
+                q_roped.astype(np.float32), k_roped.astype(np.float32), v.astype(np.float32),
+                n_heads, n_kv_heads,
+            ).astype(bfloat16)
 
     # ---- O + Residual + FFN ----
     if fused_gu:
@@ -479,6 +537,48 @@ def run_transformer_block_custom(
         return results[_out_idx].reshape(seq_len, emb_dim)
 
 
+def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_idx=0, gu_swiglu_half=0):
+    """One backbone layer as ONE dispatch of the stitched `layer` ELF
+    (layer_fused.py): RMS+QKV+RoPE, masked FlashAttention, O+FFN."""
+    from layer_fused import LAYER_INTERMEDIATE, LAYER_OUT, LAYER_STATIC
+    from o_ffn_fused_gu import interleave_gate_up
+
+    seq_len = x_bf16.shape[0]
+    emb, nh, nkv, hidden = config.emb_dim, config.n_heads, config.n_kv_heads, config.hidden_dim
+    kv = nkv * config.head_dim
+    _arg_cache = getattr(run_layer_fused, "_arg_cache", {})
+    run_layer_fused._arg_cache = _arg_cache
+    key = f"layer_L{layer_idx}"
+    if key not in _arg_cache:
+        lw = layer_weights
+        w_qkv = np.concatenate([lw.wq, lw.wk, lw.wv], axis=1).astype(bfloat16)
+        w_gateup = interleave_gate_up(np.asarray(lw.w_gate), np.asarray(lw.w_up), gu_swiglu_half).astype(bfloat16)
+
+        def z(*shape):
+            return np.zeros(shape, dtype=bfloat16)
+
+        _arg_cache[key] = [
+            None,
+            np.asarray(lw.attn_norm, dtype=bfloat16).reshape(emb), z(seq_len, emb),
+            w_qkv, z(seq_len, emb + 2 * kv),
+            np.repeat(rope_lut_bf16[:seq_len], nh, axis=0).flatten(), z(seq_len, emb),
+            np.repeat(rope_lut_bf16[:seq_len], nkv, axis=0).flatten(), z(seq_len, kv),
+            _NPU_ATTN["mask"], z(seq_len, emb),
+            np.asarray(lw.wo, dtype=bfloat16).reshape(emb, emb), z(seq_len, emb), z(seq_len, emb),
+            np.asarray(lw.ffn_norm, dtype=bfloat16).reshape(emb), z(seq_len, emb),
+            w_gateup, z(seq_len, hidden),
+            np.asarray(lw.w_down, dtype=bfloat16).reshape(hidden, emb), z(seq_len, emb),
+            z(seq_len * emb),
+        ]
+    args = _arg_cache[key]
+    args[0] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb)
+    results = cache.load_and_run(
+        "layer", _LAYER_BACKEND, *args, output_indices=[LAYER_OUT], static_input_indices=LAYER_STATIC,
+        intermediate_indices=LAYER_INTERMEDIATE, bo_key=key, shared_nonstatic=True,
+    )
+    return results[LAYER_OUT].reshape(seq_len, emb)
+
+
 def pad_seq(x, seq_pad, fill=0.0):
     out = np.full((seq_pad,) + x.shape[1:], fill, dtype=x.dtype)
     out[: x.shape[0]] = x
@@ -525,6 +625,12 @@ def main():
     ap.add_argument("--offn-tiling", default="2,2", help="runtime_loop_tiling_sizes of fused o_ffn")
     ap.add_argument("--offn-elf", default="", help="replace the compiled o_ffn.elf with this prebuilt ELF")
     ap.add_argument("--rgr-elf", default="", help="replace the compiled rms_gemms_rope.elf with this prebuilt ELF")
+    ap.add_argument("--npu-attn", action="store_true",
+                    help="masked FlashAttention as a third ELF instead of CPU attention "
+                    "(needs --fused-qkv)")
+    ap.add_argument("--fused-layer", action="store_true",
+                    help="whole layer (RMS+QKV+RoPE, FA, O+FFN) as ONE stitched ELF "
+                    "(needs --fused-qkv --fused-gu --gu-swiglu --npu-attn)")
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--save-out", default="", help="np.save every layer's NPU output (float32) here")
     ap.add_argument("--dup", default="", help="timing probe: comma list of o_ffn slice prefixes to run twice "
@@ -541,6 +647,9 @@ def main():
     )
     dup_tag = f"dup{'-'.join(offn_dup)}" if offn_dup else ""
     assert not args.gu_swiglu or args.fused_gu, "--gu-swiglu needs --fused-gu"
+    assert not args.npu_attn or args.fused_qkv, "--npu-attn needs --fused-qkv"
+    assert not args.fused_layer or (args.fused_qkv and args.fused_gu and args.gu_swiglu and args.npu_attn), (
+        "--fused-layer needs --fused-qkv --fused-gu --gu-swiglu --npu-attn")
     sw_tag = "sw" if args.gu_swiglu else ""
     gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{sw_tag}{od_tag}{dup_tag}" if args.fused_gu else ""
     qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
@@ -562,6 +671,7 @@ def main():
         gu_bstationary=args.gu_bstationary, qkv_bstationary=args.qkv_bstationary,
         od_tile_n=args.od_tile_n, o_bstationary=o_bst, dn_bstationary=dn_bst, dn_herd_m=args.dn_herd_m,
         dn_tile_m=args.dn_tile_m, dn_tile_n=args.dn_tile_n, offn_dup=offn_dup, gu_swiglu=args.gu_swiglu,
+        npu_attn=args.npu_attn, fused_layer=args.fused_layer,
     )
     for name, override in (("o_ffn", args.offn_elf), ("rms_gemms_rope", args.rgr_elf)):
         if override:
@@ -589,6 +699,8 @@ def main():
 
     mask_padded = pad_mask(layer0["attention_mask"].astype(bool), SEQ_PAD)
     _MASK_HOLDER["mask"] = mask_padded
+    if args.npu_attn:
+        _NPU_ATTN["mask"] = additive_attn_mask(mask_padded)
 
     x = pad_seq(layer0["hidden_in"].astype(bfloat16), SEQ_PAD)
     rope_lut_real = build_rope_lut_gathered(layer0["position_ids"], BACKBONE_CONFIG)
@@ -599,6 +711,9 @@ def main():
     rope_lut_padded[SEQ_REAL:] = rope_lut_real[-1]
 
     def run_one_layer(xx, i, verbose=False):
+        if args.fused_layer:
+            return run_layer_fused(xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache,
+                                   layer_idx=i, gu_swiglu_half=args.gu_tile_n // 2)
         if args.fused_gu or args.fused_qkv:
             return run_transformer_block_custom(
                 xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache, layer_idx=i,
@@ -653,7 +768,7 @@ def main():
                 xx = run_one_layer(xx, i)
             times.append((time.perf_counter() - t0) * 1e3)
         times.sort()
-        print(f"{args.layers}-layer NPU (cpu_attn=True) wall: median {times[len(times)//2]:.2f} ms, "
+        print(f"{args.layers}-layer NPU (npu_attn={args.npu_attn}) wall: median {times[len(times)//2]:.2f} ms, "
               f"min {times[0]:.2f}, max {times[-1]:.2f}")
         print("CPU baseline (Vu_exp/smolvla_backbone_perf/BACKBONE_PROFILE.md): full fill 43.9 ms")
 

@@ -163,7 +163,16 @@ def _declare_flash_channels(NS, H, NQ):
 
 
 def _declare_flash_tensors(
-    lq, lk, dk, dv, num_heads, num_kv_heads, fused_qkv, n_images
+    lq,
+    lk,
+    dk,
+    dv,
+    num_heads,
+    num_kv_heads,
+    fused_qkv,
+    n_images,
+    attn_mask=False,
+    v_cols=None,
 ):
     """Q/K/V/GP L3 tensors + head-column bases, shared by every schedule.
 
@@ -175,6 +184,10 @@ def _declare_flash_tensors(
     the same shape cost three device reconfigurations, and each head is a
     column range either way, so attention reads its blocks straight out of the
     wide buffer instead of three copied-apart ones.
+
+    v_cols: only V is read out of a wide [lk, v_cols] tensor (its heads are the
+    last num_kv_heads*dv columns), for when Q and K come from separate
+    post-RoPE buffers but V is still the tail of the fused QKV GEMM output.
     """
     emb_q = num_heads * dk
     emb_k = num_kv_heads * dk
@@ -188,10 +201,13 @@ def _declare_flash_tensors(
     else:
         Q = air.tensor([n_images * lq, emb_q], bf16)
         K = air.tensor([n_images * lk, emb_k], bf16)
-        V = air.tensor([n_images * lk, emb_v], bf16)
-        q_base = k_base = v_base = 0
+        V = air.tensor([n_images * lk, v_cols or emb_v], bf16)
+        q_base = k_base = 0
+        v_base = (v_cols or emb_v) - emb_v
+    # Inputs must be declared before the output, so the mask sits ahead of GP.
+    MASK = air.tensor([lq, lk], bf16) if attn_mask else None
     GP = air.tensor([n_images * lq, emb_out], bf16)
-    return Q, K, V, GP, q_base, k_base, v_base
+    return Q, K, V, GP, q_base, k_base, v_base, MASK
 
 
 def _make_cascade_merge(
@@ -263,7 +279,19 @@ def build_launch(
     fused_qkv=False,
     n_images=1,
     q_in_segment=False,
+    attn_mask=False,
+    v_cols=None,
 ):
+    """attn_mask: take an extra [lq, lk] bf16 input (arg 3, ahead of the output)
+    that is added to the scores before the softmax. 0 keeps a (query, key) pair;
+    bf16 lowest (0xff7f) drops it, and a row dropped entirely comes out as the
+    uniform average over all keys, like an additive float-min mask on the host.
+    Each core's block travels the Q/K channel exactly like its Q tile.
+
+    v_cols: V is a wide [lk, v_cols] tensor holding the V heads in its last
+    num_kv_heads*dv columns (see _declare_flash_tensors)."""
+    assert not (attn_mask and q_in_segment), "attn_mask is not wired into q_in_segment"
+    assert not (v_cols and (q_in_segment or fused_qkv)), "v_cols is for separate Q/K"
     if q_in_segment:
         return _build_launch_q_in_segment(
             lk=lk,
@@ -302,6 +330,15 @@ def build_launch(
             f"Causal masking requires tile_size_q == lkp, got "
             f"tile_size_q={lqp // num_q_tiles}, lkp={lkp}"
         )
+
+    if attn_mask:
+        assert not causal, "attn_mask replaces the causal mask, not both"
+        assert n_images == 1, "attn_mask is one [lq, lk] mask"
+        assert lk == lkp * num_cascade_stages, "attn_mask needs one K chunk per stage"
+        assert lq == lqp, "attn_mask needs a single q block"
+        assert (
+            lqp // num_q_tiles == lkp
+        ), "attn_mask block must be the [lkp, lkp] G tile"
 
     # Skipping fully-future blocks is unconditional under causal here.
     causal_skip = causal
@@ -369,8 +406,8 @@ def build_launch(
     ) = _declare_flash_channels(NS, H, NQ)
 
     # ---------------------------------------------------------------- tensors
-    Q, K, V, GP, q_base, k_base, v_base = _declare_flash_tensors(
-        lq, lk, dk, dv, num_heads, num_kv_heads, fused_qkv, n_images
+    Q, K, V, GP, q_base, k_base, v_base, MASK = _declare_flash_tensors(
+        lq, lk, dk, dv, num_heads, num_kv_heads, fused_qkv, n_images, attn_mask, v_cols
     )
 
     # Independent self-attention problems stacked along ROWS -- SmolVLA attends
@@ -419,6 +456,17 @@ def build_launch(
                         indices=[head_local],
                     )
 
+                # Mask: stage s's key columns, split into the NQ query tiles
+                # the same way Q is.
+                if attn_mask:
+                    for s in range(NS):
+                        qkin[s].put(
+                            MASK[0:lqp, s * lkp : s * lkp + lkp]
+                            .reshape(NQ, tile_size_q, 1, lkp)
+                            .transpose(0, 2, 1, 3),
+                            indices=[head_local],
+                        )
+
                 # K: the same split over this stage's chunks.
                 for s in range(NS):
                     row = img * lk + s * lk_per_stage
@@ -460,6 +508,11 @@ def build_launch(
                         air.alloc([tile_size_q, dk_tile], bf16, scope=seg.per_core())
                         for _ in range(dk_chunks)
                     ]
+                    m_saved = (
+                        air.alloc([tile_size_q, lkp], bf16, scope=seg.per_core())
+                        if attn_mask
+                        else None
+                    )
                     qk = air.alloc([lkp, dk_tile], bf16, scope=seg.per_core())
                     v_l1 = air.alloc([lkp, dv_tile], bf16, scope=seg.per_core())
                     g = air.alloc([tile_size_q, lkp], bf16, scope=seg.per_core())
@@ -478,7 +531,9 @@ def build_launch(
                     # receive, and the put re-describes the [lkp, dk_tile] tile
                     # in the 4x8 blocks the mmul instruction consumes.
                     for s in range(NS):
-                        for _ in air.sequential(0, NQ * dk_chunks):
+                        for _ in air.sequential(
+                            0, NQ * dk_chunks + (NQ if attn_mask else 0)
+                        ):
                             qkin[s].get(qk_l2[s], indices=[seg_x])
                             qk2l1[s].put(
                                 qk_l2[s]
@@ -539,6 +594,16 @@ def build_launch(
                                             qk2l1[s].get(qk, indices=[seg_x, ty, tx])
                                     with ops.branch(tx == qt):
                                         copy_tile(qk, q_saved[dk_c])
+
+                            # Mask selective capture, same shape as Q's. The
+                            # relay's put leaves it in G's 8x8 tiled layout.
+                            if attn_mask:
+                                for qt in range(NQ):
+                                    for s in range(NS):
+                                        with ops.branch(ty == s):
+                                            qk2l1[s].get(qk, indices=[seg_x, ty, tx])
+                                    with ops.branch(tx == qt):
+                                        copy_tile(qk, m_saved)
 
                             for chunk in air.sequential(0, chunks_per_stage):
                                 # This block's place in the mask. q_block is a
@@ -601,6 +666,8 @@ def build_launch(
                                             )
                                         else:
                                             apply_mask(g, q_block, kv_block)
+                                    if attn_mask:
+                                        add_gp_g(m_saved, g)
                                     s_tmp = air.alloc(
                                         [tile_size_q, 1], bf16, scope=h.private()
                                     )
@@ -805,7 +872,7 @@ def _build_launch_q_in_segment(
         gpout,
     ) = _declare_flash_channels(NS, H, NQ)
 
-    Q, K, V, GP, q_base, k_base, v_base = _declare_flash_tensors(
+    Q, K, V, GP, q_base, k_base, v_base, _ = _declare_flash_tensors(
         lq, lk, dk, dv, num_heads, num_kv_heads, fused_qkv, n_images
     )
 
