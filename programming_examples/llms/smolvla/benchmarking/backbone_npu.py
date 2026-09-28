@@ -259,7 +259,7 @@ def compile_backbone_kernels(
     cache, config, seq_len, herd_m_override=None, fused_gu=False, gu_tile_n=80,
     fused_qkv=False, qkv_tile_n=80, gu_bstationary=False, qkv_bstationary=False,
     od_bstationary=False, od_tile_n=80, o_bstationary=None, dn_bstationary=None, dn_herd_m=None,
-    dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False, npu_attn=False, fused_layer=False, fa_opt="-O2",
+    dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False, npu_attn=False, fused_layer=False, fa_opt="-O2", layers_per_call=1,
 ):
     """Replacement for llama32_1b_prefill.compile_all_kernels: that function
     hardcodes mm.o pre-compiles at tile_n=128 (llama32_1b's own registry
@@ -364,6 +364,16 @@ def compile_backbone_kernels(
                                 "offn": _TILING["offn"]}),
             {**_LAYER_BACKEND, "verbose": cache.verbose},
         )
+        if layers_per_call > 1:
+            from layer_fused import build_multi_layer_module
+
+            cache.compile_and_cache(
+                f"layers{layers_per_call}",
+                build_multi_layer_module(str(rgr_mod), str(fa_mod), str(offn_mod),
+                                         {"rgr": _TILING["rgr"], "fa": _FA_BACKEND["runtime_loop_tiling_sizes"],
+                                          "offn": _TILING["offn"]}, layers_per_call),
+                {**_LAYER_BACKEND, "instance_name": "layers", "verbose": cache.verbose},
+            )
     cache._save_manifest()
     print(f"Backbone kernels compiled and cached to {cache.cache_dir}/")
 
@@ -598,6 +608,41 @@ def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_i
     return results[LAYER_OUT].reshape(seq_len, emb)
 
 
+def run_layers_fused(x_bf16, first_layer, n_layers, all_weights, rope_lut_bf16, config, cache, gu_swiglu_half=0):
+    """Layers first_layer .. first_layer+n_layers-1 as ONE dispatch of the
+    `layers{n}` ELF (layer_fused.build_multi_layer_module)."""
+    from layer_fused import MULTI_PER_LAYER, MULTI_SHARED, multi_layer_arg
+
+    seq_len, emb = x_bf16.shape[0], config.emb_dim
+    _arg_cache = getattr(run_layers_fused, "_arg_cache", {})
+    run_layers_fused._arg_cache = _arg_cache
+    key = f"layers{n_layers}_L{first_layer}"
+    out_idx = n_layers % 2
+    if key not in _arg_cache:
+        per = []
+        for i in range(first_layer, first_layer + n_layers):
+            # run_layer_fused builds (and caches) the per-layer arg list; reuse its arrays.
+            if f"layer_L{i}" not in getattr(run_layer_fused, "_arg_cache", {}):
+                run_layer_fused(x_bf16, all_weights[i], rope_lut_bf16, config, cache,
+                                layer_idx=i, gu_swiglu_half=gu_swiglu_half)
+            per.append(run_layer_fused._arg_cache[f"layer_L{i}"])
+        args = [None] * (2 + len(MULTI_SHARED) + n_layers * len(MULTI_PER_LAYER))
+        args[1] = np.zeros((seq_len, emb), dtype=bfloat16)
+        for i in range(n_layers):
+            for a in MULTI_SHARED + MULTI_PER_LAYER:
+                args[multi_layer_arg(i, a)] = per[i][a]
+        static = {multi_layer_arg(0, a) for a in (5, 7, 9)} | {
+            multi_layer_arg(i, a) for i in range(n_layers) for a in MULTI_PER_LAYER}
+        _arg_cache[key] = (args, static, set(range(len(args))) - static - {0})
+    args, static, inter = _arg_cache[key]
+    args[0] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb)
+    results = cache.load_and_run(
+        f"layers{n_layers}", {**_LAYER_BACKEND, "instance_name": "layers"}, *args, output_indices=[out_idx],
+        static_input_indices=static, intermediate_indices=inter - {out_idx}, bo_key=key, shared_nonstatic=True,
+    )
+    return results[out_idx].reshape(seq_len, emb)
+
+
 def pad_seq(x, seq_pad, fill=0.0):
     out = np.full((seq_pad,) + x.shape[1:], fill, dtype=x.dtype)
     out[: x.shape[0]] = x
@@ -653,6 +698,8 @@ def main():
     ap.add_argument("--bfp16", default="",
                     help="comma list of GEMMs (qkv,o,gu,dn) taking bfp16ebs8 weights; "
                     "optional tiles as key:tile_n:tile_k_l2:tile_k_l1")
+    ap.add_argument("--layers-per-call", type=int, default=1,
+                    help="with --fused-layer: stitch this many layers into one ELF (one XRT run)")
     ap.add_argument("--fa-opt", default="-O2", help="Peano optimization level for attn_npu2.o (e.g. -Os)")
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--save-out", default="", help="np.save every layer's NPU output (float32) here")
@@ -679,6 +726,9 @@ def main():
         _BFP16[k] = tuple(map(int, tiles)) if tiles else _BFP16_TILES[k]
     assert "qkv" not in _BFP16 or args.fused_qkv, "--bfp16 qkv needs --fused-qkv"
     assert not (_BFP16.keys() - {"qkv"}) or args.fused_gu, "--bfp16 o/gu/dn needs --fused-gu"
+    lpc = args.layers_per_call
+    assert lpc == 1 or (args.fused_layer and args.layers % lpc == 0), (
+        "--layers-per-call needs --fused-layer and must divide --layers")
     sw_half = (_BFP16["gu"][0] if "gu" in _BFP16 else args.gu_tile_n) // 2
     bfp_tag = "".join(f"_b{k}{'x'.join(map(str, v))}" for k, v in _BFP16.items())
     if args.fa_opt != "-O2":
@@ -705,6 +755,7 @@ def main():
         od_tile_n=args.od_tile_n, o_bstationary=o_bst, dn_bstationary=dn_bst, dn_herd_m=args.dn_herd_m,
         dn_tile_m=args.dn_tile_m, dn_tile_n=args.dn_tile_n, offn_dup=offn_dup, gu_swiglu=args.gu_swiglu,
         npu_attn=args.npu_attn, fused_layer=args.fused_layer, fa_opt=args.fa_opt,
+        layers_per_call=args.layers_per_call,
     )
     for name, override in (("o_ffn", args.offn_elf), ("rms_gemms_rope", args.rgr_elf)):
         if override:
@@ -774,6 +825,19 @@ def main():
         xi = pad_seq(per_layer[i]["hidden_in"].astype(bfloat16), SEQ_PAD)
         npu_isolated[i] = np.array(run_one_layer(xi, i), dtype=np.float32)
 
+    def run_group(xx, g):
+        return run_layers_fused(xx, g * lpc, lpc, weights.layers, rope_lut_padded, BACKBONE_CONFIG, cache,
+                                gu_swiglu_half=sw_half)
+
+    if lpc > 1:
+        xg = pad_seq(layer0["hidden_in"].astype(bfloat16), SEQ_PAD)
+        for g in range(args.layers // lpc):
+            out = np.array(run_group(xg, g), dtype=np.float32)
+            last = (g + 1) * lpc - 1
+            print(f"  {lpc}-layer call {g}: L{last} bit-identical to per-layer ELF: "
+                  f"{np.array_equal(out, npu_outputs[last])}  cos {_cos(out, npu_outputs[last]):.6f}")
+            xg = out.astype(bfloat16)
+
     if args.save_out:
         np.save(args.save_out, np.stack([np.stack([npu_outputs[i], npu_isolated[i]]) for i in range(args.layers)]))
 
@@ -797,8 +861,12 @@ def main():
         for _ in range(args.reps):
             t0 = time.perf_counter()
             xx = x
-            for i in range(args.layers):
-                xx = run_one_layer(xx, i)
+            if lpc > 1:
+                for g in range(args.layers // lpc):
+                    xx = run_group(xx, g)
+            else:
+                for i in range(args.layers):
+                    xx = run_one_layer(xx, i)
             times.append((time.perf_counter() - t0) * 1e3)
         times.sort()
         print(f"{args.layers}-layer NPU (npu_attn={args.npu_attn}) wall: median {times[len(times)//2]:.2f} ms, "
@@ -812,7 +880,12 @@ def main():
             avg_k = sum(e["kernel_ms"] for e in entries) / n
             avg_r = sum(e["read_ms"] for e in entries) / n
             print(f"  {name:20s} write={avg_w:7.3f}ms  device={avg_k:7.3f}ms  read={avg_r:7.3f}ms"
-                  f"  total={avg_w+avg_k+avg_r:7.3f}ms  (x{n} calls, {n // args.layers // args.reps if n else 0}/layer)")
+                  f"  total={avg_w+avg_k+avg_r:7.3f}ms  (x{n} calls)")
+            ks = sorted(e["kernel_ms"] for e in entries)
+            print(f"  {'':20s} device min {ks[0]:.3f}  p10 {ks[n // 10]:.3f}  median {ks[n // 2]:.3f}  "
+                  f"p90 {ks[9 * n // 10]:.3f}  max {ks[-1]:.3f}")
+            if name.startswith("layers"):
+                print(f"  {'':20s} device per layer = {avg_k / lpc:7.3f}ms  (median {ks[n // 2] / lpc:.3f})")
         if cache.profiler.cpu_times:
             print("\n--- CPU-side ops (attention fallback etc.) ---")
             for name, ts in sorted(cache.profiler.cpu_times.items()):

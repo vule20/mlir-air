@@ -87,3 +87,67 @@ def build_layer_module(rgr_ir, fa_ir, offn_ir, tilings):
             op.attributes["air.shim_dma_tile_sizes"] = DenseI64ArrayAttr.get(ts)
     print(f"  Layer module: {len(launches)} launches, {len(str(module).splitlines())} lines, parsed OK")
     return module
+
+
+# N layers in one func. Layer args shared by every layer (luts, mask,
+# intermediates) appear once; the per-layer weights repeat. Layer i reads
+# X[i % 2] and writes X[(i + 1) % 2] through a flat view (o_ffn's output is 1-D).
+MULTI_SHARED = (2, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 19)
+MULTI_PER_LAYER = (1, 3, 11, 14, 16, 18)
+
+
+def multi_layer_arg(layer, layer_arg):
+    """Combined arg index of `layer`'s single-layer arg `layer_arg` (not 0 / 20)."""
+    if layer_arg in MULTI_SHARED:
+        return 2 + MULTI_SHARED.index(layer_arg)
+    return 2 + len(MULTI_SHARED) + layer * len(MULTI_PER_LAYER) + MULTI_PER_LAYER.index(layer_arg)
+
+
+def build_multi_layer_module(rgr_ir, fa_ir, offn_ir, tilings, n_layers):
+    single = build_layer_module(rgr_ir, fa_ir, offn_ir, tilings)
+    types = _signature_types(str(single))
+    n_args = 2 + len(MULTI_SHARED) + n_layers * len(MULTI_PER_LAYER)
+    comb = [types[0], types[0]] + [None] * (n_args - 2)
+    for i in range(n_layers):
+        for a in MULTI_SHARED + MULTI_PER_LAYER:
+            comb[multi_layer_arg(i, a)] = types[a]
+    base_args = [FuncArg(f"%arg{i}", t) for i, t in enumerate(comb)]
+
+    flat = types[20]
+    seq_emb = re.search(r"memref<(\d+)x(\d+)xbf16>", types[0]).groups()
+    prelude = "\n".join(
+        f"    %x{j}_flat = memref.reinterpret_cast %arg{j} to offset: [0], "
+        f"sizes: [{int(seq_emb[0]) * int(seq_emb[1])}], strides: [1] : {types[0]} to {flat}"
+        for j in (0, 1)
+    )
+
+    parts = (("rg", rgr_ir, _RGR_MAP, "rgr"), ("at", fa_ir, _FA_MAP, "fa"), ("of", offn_ir, _OFFN_MAP, "offn"))
+    slices, per_launch = [], []
+    for i in range(n_layers):
+        for p, ir, amap, key in parts:
+            m, aliases = {}, {}
+            for op_idx, layer_arg in amap.items():
+                if layer_arg == 0:
+                    m[op_idx] = i % 2
+                elif layer_arg == 20:
+                    aliases[op_idx] = f"%x{(i + 1) % 2}_flat"
+                else:
+                    m[op_idx] = multi_layer_arg(i, layer_arg)
+            slices.append(KernelSlice(ir, f"{p}{i}", m, arg_aliases=aliases, extern_syms=_privates(ir)))
+            per_launch += [tilings[key]] * ir.count("air.launch ")
+    module = stitch_elf("layers", base_args, slices, prelude=prelude,
+                        debug_dump_path="/tmp/layers_fused_parse_error.mlir")
+
+    from air.ir import DenseI64ArrayAttr
+
+    func = next(
+        op for op in module.body.operations
+        if op.operation.name == "func.func" and op.attributes["sym_name"].value == "layers"
+    )
+    launches = [op for op in func.regions[0].blocks[0].operations if op.operation.name == "air.launch"]
+    assert len(launches) == len(per_launch), (len(launches), len(per_launch))
+    with module.context:
+        for op, ts in zip(launches, per_launch):
+            op.attributes["air.shim_dma_tile_sizes"] = DenseI64ArrayAttr.get(ts)
+    print(f"  {n_layers}-layer module: {len(launches)} launches, {n_args} args, parsed OK")
+    return module
