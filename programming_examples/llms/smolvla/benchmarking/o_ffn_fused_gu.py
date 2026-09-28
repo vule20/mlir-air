@@ -79,7 +79,10 @@ def _build_swiglu_from_wide(rows, hidden_dim, np_dtype, herd_x=8, herd_y=1, targ
     return launch.build(target=target)
 
 
-def build_o_ffn_module_fused_gu(seq_len, emb_dim, hidden_dim, herd_m=4, herd_n=4, print_kernels=False, gu_tile_n=80):
+def build_o_ffn_module_fused_gu(
+    seq_len, emb_dim, hidden_dim, herd_m=4, herd_n=4, print_kernels=False, gu_tile_n=80, gu_b_stationary=False,
+    od_b_stationary=False, od_tile_n=80,
+):
     """O-proj + Residual + FFN with Gate+Up fused into one GEMM.
 
     7 launches, args (base, before scratch tail):
@@ -98,22 +101,39 @@ def build_o_ffn_module_fused_gu(seq_len, emb_dim, hidden_dim, herd_m=4, herd_n=4
       %arg12 output      (seq_len*emb_dim,)                FFN Add output
     """
     from shared.builders.gemm_builder import _build_gemm_module, gemm_registry_config, disambiguate_by_tile_n
+    from shared.infra.external_kernels import compile_gemm_mm
     from weighted_rms_norm.weighted_rms_norm import build_module as build_rms
-
-    o_spec = gemm_registry_config(seq_len, emb_dim, emb_dim, "bf16", "high")
-    d_spec = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high")
-    o_spec, d_spec = disambiguate_by_tile_n([o_spec, d_spec])
-
-    def _tiles(spec):
-        return (dict(spec["build_kwargs"]), spec["tile_m"], spec["tile_k_l2"], spec["tile_k_l1"], spec["tile_n"])
-
-    _o_kw, _o_m, _o_k2, _o_k1, _o_n = _tiles(o_spec)
-    _d_kw, _d_m, _d_k2, _d_k1, _d_n = _tiles(d_spec)
 
     n_total = seq_len * emb_dim
 
-    print("  [1/7] O GEMM (drain)...")
-    o_ir = str(_build_gemm_module(seq_len, emb_dim, emb_dim, _o_m, _o_k2, _o_k1, _o_n, herd_m, herd_n, **_o_kw))
+    def _custom_extern_syms(sfx):
+        return {"@matmul_bf16", "@op_has_no_registered_library_name" + sfx, "@zero_f32_mn" + sfx, "@f32_to_bf16_mn" + sfx}
+
+    def _registry_extern_syms(spec):
+        return _custom_extern_syms(spec["sym_suffix"])
+
+    if od_b_stationary:
+        # Bypass the registry (tile_k_l2=320, not full-K) with explicit
+        # full-K + b_stationary=True, same lever as the QKV/GateUp fusions.
+        print("  [1/7] O GEMM, B-stationary (drain)...")
+        compile_gemm_mm(tile_m=32, tile_n=od_tile_n, tile_k_l1=32, sym_suffix="_o", out_name="mm_o.o")
+        o_ir = str(
+            _build_gemm_module(
+                seq_len, emb_dim, emb_dim, 32, emb_dim, 32, od_tile_n, herd_m, herd_n,
+                external_bf16_out=True, sym_suffix="_o", link_with_name="mm_o.o", b_stationary=True,
+            )
+        )
+        o_extern_syms = _custom_extern_syms("_o")
+    else:
+        o_spec = gemm_registry_config(seq_len, emb_dim, emb_dim, "bf16", "high")
+        d_spec_probe = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high")
+        o_spec, _ = disambiguate_by_tile_n([o_spec, d_spec_probe])
+        _o_kw, _o_m, _o_k2, _o_k1, _o_n = (
+            dict(o_spec["build_kwargs"]), o_spec["tile_m"], o_spec["tile_k_l2"], o_spec["tile_k_l1"], o_spec["tile_n"],
+        )
+        print("  [1/7] O GEMM (drain)...")
+        o_ir = str(_build_gemm_module(seq_len, emb_dim, emb_dim, _o_m, _o_k2, _o_k1, _o_n, herd_m, herd_n, **_o_kw))
+        o_extern_syms = _registry_extern_syms(o_spec)
 
     print("  [2/7] Residual Add (2D -> 2D)...")
     res_add_ir = str(_build_add_2d_to_2d(seq_len, emb_dim, bfloat16))
@@ -126,21 +146,38 @@ def build_o_ffn_module_fused_gu(seq_len, emb_dim, hidden_dim, herd_m=4, herd_n=4
     gu_n = 2 * hidden_dim
     gu_tile_k1 = 32
     print("  [4/7] GateUp GEMM, fused (drain)...")
-    from shared.infra.external_kernels import compile_gemm_mm
-
     compile_gemm_mm(tile_m=32, tile_n=gu_tile_n, tile_k_l1=gu_tile_k1, sym_suffix="_gu", out_name="mm_gu.o")
     gu_ir = str(
         _build_gemm_module(
             seq_len, emb_dim, gu_n, 32, emb_dim, gu_tile_k1, gu_tile_n, herd_m, herd_n,
             external_bf16_out=True, sym_suffix="_gu", link_with_name="mm_gu.o",
+            b_stationary=gu_b_stationary,
         )
     )
 
     print("  [5/7] SwiGLU (from fused GateUp buffer)...")
     swiglu_ir = _wrap_ir_in_launch(str(_build_swiglu_from_wide(seq_len, hidden_dim, bfloat16, herd_x=8)))
 
-    print("  [6/7] Down GEMM (drain)...")
-    down_ir = str(_build_gemm_module(seq_len, hidden_dim, emb_dim, _d_m, _d_k2, _d_k1, _d_n, herd_m, herd_n, **_d_kw))
+    if od_b_stationary:
+        print("  [6/7] Down GEMM, B-stationary (drain)...")
+        compile_gemm_mm(tile_m=32, tile_n=od_tile_n, tile_k_l1=32, sym_suffix="_dn", out_name="mm_dn.o")
+        down_ir = str(
+            _build_gemm_module(
+                seq_len, hidden_dim, emb_dim, 32, hidden_dim, 32, od_tile_n, herd_m, herd_n,
+                external_bf16_out=True, sym_suffix="_dn", link_with_name="mm_dn.o", b_stationary=True,
+            )
+        )
+        down_extern_syms = _custom_extern_syms("_dn")
+    else:
+        d_spec = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high")
+        o_spec_probe = gemm_registry_config(seq_len, emb_dim, emb_dim, "bf16", "high")
+        _, d_spec = disambiguate_by_tile_n([o_spec_probe, d_spec])
+        _d_kw, _d_m, _d_k2, _d_k1, _d_n = (
+            dict(d_spec["build_kwargs"]), d_spec["tile_m"], d_spec["tile_k_l2"], d_spec["tile_k_l1"], d_spec["tile_n"],
+        )
+        print("  [6/7] Down GEMM (drain)...")
+        down_ir = str(_build_gemm_module(seq_len, hidden_dim, emb_dim, _d_m, _d_k2, _d_k1, _d_n, herd_m, herd_n, **_d_kw))
+        down_extern_syms = _registry_extern_syms(d_spec)
 
     print("  [7/7] FFN Add (2D -> 1D)...")
     ffn_add_ir = str(_build_add_2d_to_1d(seq_len, emb_dim, bfloat16))
@@ -152,10 +189,6 @@ def build_o_ffn_module_fused_gu(seq_len, emb_dim, hidden_dim, herd_m=4, herd_n=4
         ]:
             print(f"\n{'='*60}\n  Sub-kernel: {name} ({len(ir.splitlines())} lines)\n{'='*60}")
             print(ir)
-
-    def _gemm_extern_syms(spec):
-        sfx = spec["sym_suffix"]
-        return {"@matmul_bf16", "@op_has_no_registered_library_name" + sfx, "@zero_f32_mn" + sfx, "@f32_to_bf16_mn" + sfx}
 
     def _gemm_arg_map(in_idx, w_idx, out_idx, sc):
         if sc is not None:
@@ -179,17 +212,17 @@ def build_o_ffn_module_fused_gu(seq_len, emb_dim, hidden_dim, herd_m=4, herd_n=4
         FuncArg("%arg11", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg12", f"memref<{n_total}xbf16>"),
     ]
-    scratch_args, scratch_for = alloc_gemm_scratch(
-        [(o_spec, seq_len, emb_dim), (d_spec, seq_len, emb_dim)], base_arg_count=13,
-    )
+    # Both O and Down always resolve to drain here (registry-driven or the
+    # explicit b_stationary bypass), so neither needs an f32 fused-cast scratch.
+    scratch_args, scratch_for = [], (None, None)
 
     slices = [
-        KernelSlice(o_ir, "og", _gemm_arg_map(0, 1, 2, scratch_for[0]), extern_syms=_gemm_extern_syms(o_spec)),
+        KernelSlice(o_ir, "og", _gemm_arg_map(0, 1, 2, scratch_for[0]), extern_syms=o_extern_syms),
         KernelSlice(res_add_ir, "ra", {0: 2, 1: 3, 2: 4}, private_from=False),
         KernelSlice(rms_ir, "rm", {0: 4, 1: 5, 2: 6}, private_from=False),
         KernelSlice(gu_ir, "gu", {0: 6, 1: 7, 2: 8}, extern_syms=gu_extern_syms),
         KernelSlice(swiglu_ir, "sw", {0: 8, 1: 9}, extern_syms={"@silu_and_mul_bf16"}),
-        KernelSlice(down_ir, "dg", _gemm_arg_map(9, 10, 11, scratch_for[1]), extern_syms=_gemm_extern_syms(d_spec)),
+        KernelSlice(down_ir, "dg", _gemm_arg_map(9, 10, 11, scratch_for[1]), extern_syms=down_extern_syms),
         KernelSlice(ffn_add_ir, "fa", {0: 11, 1: 4, 2: 12}, private_from=False),
     ]
 

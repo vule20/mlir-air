@@ -30,7 +30,7 @@ from rope_from_wide import build_rope_from_wide
 
 def build_rms_gemms_rope_module_fused_qkv(
     seq_len, emb_dim, kv_dim, n_heads, n_kv_heads, head_dim, herd_m=4, herd_n=4,
-    qkv_tile_n=80, print_kernels=False,
+    qkv_tile_n=80, print_kernels=False, b_stationary=False,
 ):
     """RMSNorm + fused QKV GEMM + RoPE-Q-from-wide + RoPE-K-from-wide.
 
@@ -63,6 +63,7 @@ def build_rms_gemms_rope_module_fused_qkv(
         _build_gemm_module(
             seq_len, emb_dim, qkv_n, 32, emb_dim, 32, qkv_tile_n, herd_m, herd_n,
             external_bf16_out=True, sym_suffix="_qkv", link_with_name="mm_qkv.o",
+            b_stationary=b_stationary,
         )
     )
 

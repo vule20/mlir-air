@@ -215,7 +215,8 @@ def capture_real_backbone_io(policy, n_layers_to_capture):
 
 def compile_backbone_kernels(
     cache, config, seq_len, herd_m_override=None, fused_gu=False, gu_tile_n=80,
-    fused_qkv=False, qkv_tile_n=80,
+    fused_qkv=False, qkv_tile_n=80, gu_bstationary=False, qkv_bstationary=False,
+    od_bstationary=False, od_tile_n=80,
 ):
     """Replacement for llama32_1b_prefill.compile_all_kernels: that function
     hardcodes mm.o pre-compiles at tile_n=128 (llama32_1b's own registry
@@ -249,6 +250,7 @@ def compile_backbone_kernels(
             build_rms_gemms_rope_module_fused_qkv(
                 seq_len, config.emb_dim, config.n_kv_heads * config.head_dim,
                 config.n_heads, config.n_kv_heads, config.head_dim, herd_m=gemm_herd_m, qkv_tile_n=qkv_tile_n,
+                b_stationary=qkv_bstationary,
             ),
             {"verbose": cache.verbose, "omit_while_true_loop": False, "output_format": "elf",
              "instance_name": "rms_gemms_rope_fused_qkv", "runtime_loop_tiling_sizes": [2, 2]},
@@ -276,6 +278,7 @@ def compile_backbone_kernels(
             "o_ffn",
             build_o_ffn_module_fused_gu(
                 seq_len, config.emb_dim, config.hidden_dim, herd_m=gemm_herd_m, gu_tile_n=gu_tile_n,
+                gu_b_stationary=gu_bstationary, od_b_stationary=od_bstationary, od_tile_n=od_tile_n,
             ),
             {**o_ffn_backend, "instance_name": "o_ffn_fused_gu"},
         )
@@ -490,6 +493,10 @@ def main():
     ap.add_argument("--gu-tile-n", type=int, default=80)
     ap.add_argument("--fused-qkv", action="store_true", help="Q+K+V fused into 1 GEMM (4 launches vs 6)")
     ap.add_argument("--qkv-tile-n", type=int, default=80)
+    ap.add_argument("--gu-bstationary", action="store_true")
+    ap.add_argument("--qkv-bstationary", action="store_true")
+    ap.add_argument("--od-bstationary", action="store_true", help="O/Down GEMMs bypass registry, full-K + B-stationary")
+    ap.add_argument("--od-tile-n", type=int, default=48)
     args = ap.parse_args()
 
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -506,8 +513,8 @@ def main():
           f"mask: {layer0['attention_mask'].shape}")
 
     hm_tag = f"_hm{args.herd_m}" if args.herd_m else ""
-    gu_tag = f"_fgu{args.gu_tile_n}" if args.fused_gu else ""
-    qkv_tag = f"_fqkv{args.qkv_tile_n}" if args.fused_qkv else ""
+    gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{'od' if args.od_bstationary else ''}" if args.fused_gu else ""
+    qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
     cache_dir = str(Path(__file__).resolve().parent / "build" / f"backbone_npu_cache{hm_tag}{gu_tag}{qkv_tag}")
     from shared.infra.cache import KernelCache, Profiler
 
@@ -518,6 +525,8 @@ def main():
         cache, BACKBONE_CONFIG, SEQ_PAD, herd_m_override=args.herd_m,
         fused_gu=args.fused_gu, gu_tile_n=args.gu_tile_n,
         fused_qkv=args.fused_qkv, qkv_tile_n=args.qkv_tile_n,
+        gu_bstationary=args.gu_bstationary, qkv_bstationary=args.qkv_bstationary,
+        od_bstationary=args.od_bstationary, od_tile_n=args.od_tile_n,
     )
     prefill.attention_reference = _patched_attention_reference
 
