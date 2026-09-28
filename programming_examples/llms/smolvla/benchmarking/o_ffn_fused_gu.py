@@ -162,12 +162,15 @@ def build_o_ffn_module_fused_gu(
         from gemm_bfp16 import bfp16_extern_syms, bfp16_weight_type, build_gemm_bfp16, compile_mm_bfp16
 
         def _bfp16_gemm(key, k, n, swiglu=False):
-            tn, tk2, tk1 = bfp16[key]
+            # Optional 4th value: spread N over that many array columns (cols_n).
+            tn, tk2, tk1, *cols = bfp16[key]
             sfx, obj = f"_{key}b", f"mm_{key}b.o"
-            print(f"  {key} GEMM, bfp16 weights (tile_n {tn}, K {tk2}x{tk1}{', SwiGLU drain' if swiglu else ''})...")
+            print(f"  {key} GEMM, bfp16 weights (tile_n {tn}, K {tk2}x{tk1}"
+                  f"{f', N over {cols[0]} columns' if cols else ''}{', SwiGLU drain' if swiglu else ''})...")
             compile_mm_bfp16(32, tn, tk1, sfx, obj)
             w_types[key] = bfp16_weight_type(k, n, tn, tk1)
-            ir = str(build_gemm_bfp16(seq_len, k, n, 32, tk2, tk1, tn, herd_m, herd_n, sfx, obj, swiglu=swiglu))
+            ir = str(build_gemm_bfp16(seq_len, k, n, 32, tk2, tk1, tn, herd_m, cols[0] if cols else herd_n, sfx, obj,
+                                      swiglu=swiglu, cols_n=bool(cols)))
             return ir, bfp16_extern_syms(sfx, swiglu)
 
     if "o" in bfp16:

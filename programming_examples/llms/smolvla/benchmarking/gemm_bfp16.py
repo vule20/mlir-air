@@ -45,9 +45,11 @@ def bfp16_weight_type(k, n, tile_n, tile_k_l1):
 
 
 def build_gemm_bfp16(m, k, n, tile_m, tile_k_l2, tile_k_l1, tile_n, herd_m, herd_n, sym_suffix, link_with,
-                     swiglu=False):
+                     swiglu=False, cols_n=False):
     """Module text contract as matmul_bf16_x_bfp16.build_module: args (A [m,k]
-    bf16, B packed i8, C [m, n or n/2] bf16), one air.launch."""
+    bf16, B packed i8, C [m, n or n/2] bf16), one air.launch. The herd's first
+    axis is placed along the array columns, each with its own shim DMAs; cols_n
+    puts N there (herd_n columns, each streaming its own B slice) instead of M."""
     from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import bfp_tile_bytes
 
     r, s, t = 8, 8, 8
@@ -83,16 +85,23 @@ def build_gemm_bfp16(m, k, n, tile_m, tile_k_l2, tile_k_l1, tile_n, herd_m, herd
                     l2_a = air.alloc([herd_m, tile_m, tile_k_l2], bf16, scope=seg.private())
                     l2_b = air.alloc([herd_n, k_per_l2, tile_bytes], i8, scope=seg.private())
                     l2_c = air.alloc([herd_m, herd_n, tile_m, out_tn], bf16, scope=seg.private())
-                    acc = air.alloc([herd_m, herd_n, tile_n // t, tile_m // r, r, t], f32, scope=seg.shared())
-                    drain = air.alloc([herd_m, herd_n, out_tn // t, tile_m // r, r, t], bf16, scope=seg.shared())
+                    hd = (herd_n, herd_m) if cols_n else (herd_m, herd_n)
+                    acc = air.alloc([*hd, tile_n // t, tile_m // r, r, t], f32, scope=seg.shared())
+                    drain = air.alloc([*hd, out_tn // t, tile_m // r, r, t], bf16, scope=seg.shared())
 
                     row, col = li * l2_m, lj * l2_n
                     n_outer = lj * herd_n
 
-                    with air.herd([range(herd_m), range(herd_n)], name="herd_0", shape=(herd_m, herd_n)) as zh:
+                    def herd():
+                        return air.herd([range(hd[0]), range(hd[1])], name="herd_0", shape=hd)
+
+                    def mn(hx, hy):
+                        return (hy, hx) if cols_n else (hx, hy)
+
+                    with herd() as zh:
 
                         @zh.body
-                        def _(tx, ty):
+                        def _(hx, hy):
                             zero_acc(acc)
 
                     for k2 in air.sequential(k // tile_k_l2):
@@ -104,10 +113,11 @@ def build_gemm_bfp16(m, k, n, tile_m, tile_k_l2, tile_k_l1, tile_n, herd_m, herd
                         )
                         ops.load(l2_b, B[n_outer : n_outer + herd_n, k_chunk_off : k_chunk_off + k_per_l2, :])
 
-                        with air.herd([range(herd_m), range(herd_n)], name="herd_0", shape=(herd_m, herd_n)) as h:
+                        with herd() as h:
 
                             @h.body
-                            def _(tx, ty):
+                            def _(hx, hy):
+                                tx, ty = mn(hx, hy)
                                 l1_a = air.alloc([1, 1, tile_m // r, tile_k_l1 // s, r, s], bf16, scope=h.private())
                                 l1_b = air.alloc([tile_bytes], i8, scope=h.private())
                                 for j in air.sequential(k_per_l2):
@@ -121,12 +131,13 @@ def build_gemm_bfp16(m, k, n, tile_m, tile_k_l2, tile_k_l1, tile_n, herd_m, herd
                                     ops.load(l1_b, l2_b[ty, j, :])
                                     matmul(l1_a, l1_b, acc)
 
-                    with air.herd([range(herd_m), range(herd_n)], name="herd_0", shape=(herd_m, herd_n)) as dh:
+                    with herd() as dh:
 
                         @dh.body
-                        def _(tx, ty):
+                        def _(hx, hy):
+                            tx, ty = mn(hx, hy)
                             drain_fn(acc, drain)
-                            ops.store(drain[tx, ty, :, :, :, :].transpose(0, 1, 3, 4, 2, 5), l2_c[tx, ty, :, :])
+                            ops.store(drain[hx, hy, :, :, :, :].transpose(0, 1, 3, 4, 2, 5), l2_c[tx, ty, :, :])
 
                     ops.store(l2_c.transpose(0, 2, 1, 3), C[row : row + l2_m, col : col + l2_n])
 

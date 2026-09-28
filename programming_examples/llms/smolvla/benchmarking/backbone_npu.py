@@ -155,7 +155,7 @@ _LAYER_BACKEND = {"verbose": False, "omit_while_true_loop": False, "output_forma
 
 # GEMMs taking bfp16ebs8 weights -> (tile_n, tile_k_l2, tile_k_l1) (main() fills from --bfp16).
 _BFP16 = {}
-_BFP16_TILES = {"qkv": (80, 320, 64), "o": (80, 960, 64), "gu": (128, 320, 64), "dn": (80, 640, 64)}
+_BFP16_TILES = {"qkv": (80, 480, 160), "o": (80, 480, 160), "gu": (128, 480, 160, 8), "dn": (80, 256, 128)}
 
 
 def _weight(key, w):
@@ -165,7 +165,7 @@ def _weight(key, w):
         return w
     from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import pack_b_bfp16ebs8
 
-    tn, _, tk1 = _BFP16[key]
+    tn, _, tk1 = _BFP16[key][:3]
     return pack_b_bfp16ebs8(w, tn, tk1)
 
 
@@ -697,7 +697,8 @@ def main():
                     "(needs --fused-qkv --fused-gu --gu-swiglu --npu-attn)")
     ap.add_argument("--bfp16", default="",
                     help="comma list of GEMMs (qkv,o,gu,dn) taking bfp16ebs8 weights; "
-                    "optional tiles as key:tile_n:tile_k_l2:tile_k_l1")
+                    "optional tiles as key:tile_n:tile_k_l2:tile_k_l1[:columns] (o/gu/dn: N spread "
+                    "over that many array columns)")
     ap.add_argument("--layers-per-call", type=int, default=1,
                     help="with --fused-layer: stitch this many layers into one ELF (one XRT run)")
     ap.add_argument("--fa-opt", default="-O2", help="Peano optimization level for attn_npu2.o (e.g. -Os)")
@@ -725,6 +726,7 @@ def main():
         assert k in _BFP16_TILES, f"--bfp16: unknown GEMM {k}"
         _BFP16[k] = tuple(map(int, tiles)) if tiles else _BFP16_TILES[k]
     assert "qkv" not in _BFP16 or args.fused_qkv, "--bfp16 qkv needs --fused-qkv"
+    assert len(_BFP16.get("qkv", ())) <= 3, "--bfp16 qkv takes no column count"
     assert not (_BFP16.keys() - {"qkv"}) or args.fused_gu, "--bfp16 o/gu/dn needs --fused-gu"
     lpc = args.layers_per_call
     assert lpc == 1 or (args.fused_layer and args.layers % lpc == 0), (

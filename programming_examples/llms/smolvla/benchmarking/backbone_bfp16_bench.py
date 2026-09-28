@@ -72,6 +72,9 @@ def main():
     ap.add_argument("--variant", choices=["bf16", "bfp16", "bfp16l"], required=True,
                     help="bfp16l = gemm_bfp16.py (suffixed symbols, optional --swiglu)")
     ap.add_argument("--swiglu", action="store_true", help="bfp16l: SwiGLU drain, output n/2 wide")
+    ap.add_argument("--herd-m", type=int, default=HERD, help="bfp16l: herd rows over M")
+    ap.add_argument("--herd-n", type=int, default=HERD, help="bfp16l: herd size over N")
+    ap.add_argument("--cols-n", action="store_true", help="bfp16l: place N (not M) along the array columns")
     ap.add_argument("--tile-n", type=int, default=None, help="bfp16 tile_n (default: the bf16 one)")
     ap.add_argument("--tk2", type=int, default=None, help="bfp16 tile_k_l2 (default: K)")
     ap.add_argument("--tk1", type=int, default=64, help="bfp16 tile_k_l1")
@@ -89,7 +92,8 @@ def main():
     tiling = [int(t) for t in args.tiling.split(",")]
     tag = (f"{args.shape}_{args.variant}"
            + (f"_n{tile_n}_k{tk2}x{args.tk1}{args.opt.replace('-', '_')}" if args.variant != "bf16" else "")
-           + ("_sw" if args.swiglu else "") + f"_t{'x'.join(map(str, tiling))}")
+           + ("_sw" if args.swiglu else "") + f"_h{args.herd_m}x{args.herd_n}{'c' if args.cols_n else ''}"
+           + f"_t{'x'.join(map(str, tiling))}")
     cache = KernelCache(str(_HERE / "build" / f"bfp16bb_{tag}"), verbose=False, profiler=Profiler(enabled=True))
     if args.variant == "bf16":
         mod = build_bf16(k, n, tn_bf16, bst)
@@ -99,8 +103,8 @@ def main():
         from gemm_bfp16 import build_gemm_bfp16, compile_mm_bfp16
 
         compile_mm_bfp16(TILE_M, tile_n, args.tk1, "_tst", "mm_bfp16_tst.o")
-        mod = build_gemm_bfp16(M, k, n, TILE_M, tk2, args.tk1, tile_n, HERD, HERD, "_tst", "mm_bfp16_tst.o",
-                               swiglu=args.swiglu)
+        mod = build_gemm_bfp16(M, k, n, TILE_M, tk2, args.tk1, tile_n, args.herd_m, args.herd_n, "_tst",
+                               "mm_bfp16_tst.o", swiglu=args.swiglu, cols_n=args.cols_n)
     inst = "matmul_bf16" if args.variant == "bf16" else "matmul_bf16_x_bfp16"
     backend = {"verbose": False, "omit_while_true_loop": False, "output_format": "elf",
                "instance_name": inst, "runtime_loop_tiling_sizes": tiling}
