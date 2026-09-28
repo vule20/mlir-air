@@ -259,7 +259,7 @@ def compile_backbone_kernels(
     cache, config, seq_len, herd_m_override=None, fused_gu=False, gu_tile_n=80,
     fused_qkv=False, qkv_tile_n=80, gu_bstationary=False, qkv_bstationary=False,
     od_bstationary=False, od_tile_n=80, o_bstationary=None, dn_bstationary=None, dn_herd_m=None,
-    dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False, npu_attn=False, fused_layer=False,
+    dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False, npu_attn=False, fused_layer=False, fa_opt="-O2",
 ):
     """Replacement for llama32_1b_prefill.compile_all_kernels: that function
     hardcodes mm.o pre-compiles at tile_n=128 (llama32_1b's own registry
@@ -336,12 +336,17 @@ def compile_backbone_kernels(
         )
     if npu_attn:
         from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import build_module
-        from shared.infra.external_kernels import compile_attn_npu2
+        import shared.infra.external_kernels as ek
 
         hd = config.head_dim
         kv_dim = config.n_kv_heads * hd
-        # bfp16=True: the plain bf16 microkernel NaNs at this shape.
-        compile_attn_npu2(head_dim=hd, bfp16=True, force=True)
+        peano_flags = ek._PEANO_FLAGS
+        ek._PEANO_FLAGS = [fa_opt if f == "-O2" else f for f in peano_flags]
+        try:
+            # bfp16=True: the plain bf16 microkernel NaNs at this shape.
+            ek.compile_attn_npu2(head_dim=hd, bfp16=True, force=True)
+        finally:
+            ek._PEANO_FLAGS = peano_flags
         # V is read in place from the fused QKV GEMM output (its last kv_dim columns).
         fa_mod = build_module(lk=seq_len, lkp=hd, lq=seq_len, lqp=seq_len, dk=hd, dv=hd,
                               num_q_tiles=seq_len // hd, num_cascade_stages=seq_len // hd,
@@ -648,6 +653,7 @@ def main():
     ap.add_argument("--bfp16", default="",
                     help="comma list of GEMMs (qkv,o,gu,dn) taking bfp16ebs8 weights; "
                     "optional tiles as key:tile_n:tile_k_l2:tile_k_l1")
+    ap.add_argument("--fa-opt", default="-O2", help="Peano optimization level for attn_npu2.o (e.g. -Os)")
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--save-out", default="", help="np.save every layer's NPU output (float32) here")
     ap.add_argument("--dup", default="", help="timing probe: comma list of o_ffn slice prefixes to run twice "
@@ -675,6 +681,8 @@ def main():
     assert not (_BFP16.keys() - {"qkv"}) or args.fused_gu, "--bfp16 o/gu/dn needs --fused-gu"
     sw_half = (_BFP16["gu"][0] if "gu" in _BFP16 else args.gu_tile_n) // 2
     bfp_tag = "".join(f"_b{k}{'x'.join(map(str, v))}" for k, v in _BFP16.items())
+    if args.fa_opt != "-O2":
+        bfp_tag += f"_fa{args.fa_opt.lstrip('-')}"
     sw_tag = "sw" if args.gu_swiglu else ""
     gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{sw_tag}{od_tag}{dup_tag}" if args.fused_gu else ""
     qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
@@ -696,7 +704,7 @@ def main():
         gu_bstationary=args.gu_bstationary, qkv_bstationary=args.qkv_bstationary,
         od_tile_n=args.od_tile_n, o_bstationary=o_bst, dn_bstationary=dn_bst, dn_herd_m=args.dn_herd_m,
         dn_tile_m=args.dn_tile_m, dn_tile_n=args.dn_tile_n, offn_dup=offn_dup, gu_swiglu=args.gu_swiglu,
-        npu_attn=args.npu_attn, fused_layer=args.fused_layer,
+        npu_attn=args.npu_attn, fused_layer=args.fused_layer, fa_opt=args.fa_opt,
     )
     for name, override in (("o_ffn", args.offn_elf), ("rms_gemms_rope", args.rgr_elf)):
         if override:
