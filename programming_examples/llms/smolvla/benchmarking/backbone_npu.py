@@ -216,7 +216,8 @@ def capture_real_backbone_io(policy, n_layers_to_capture):
 def compile_backbone_kernels(
     cache, config, seq_len, herd_m_override=None, fused_gu=False, gu_tile_n=80,
     fused_qkv=False, qkv_tile_n=80, gu_bstationary=False, qkv_bstationary=False,
-    od_bstationary=False, od_tile_n=80,
+    od_bstationary=False, od_tile_n=80, o_bstationary=None, dn_bstationary=None, dn_herd_m=None,
+    dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False,
 ):
     """Replacement for llama32_1b_prefill.compile_all_kernels: that function
     hardcodes mm.o pre-compiles at tile_n=128 (llama32_1b's own registry
@@ -279,6 +280,8 @@ def compile_backbone_kernels(
             build_o_ffn_module_fused_gu(
                 seq_len, config.emb_dim, config.hidden_dim, herd_m=gemm_herd_m, gu_tile_n=gu_tile_n,
                 gu_b_stationary=gu_bstationary, od_b_stationary=od_bstationary, od_tile_n=od_tile_n,
+                o_b_stationary=o_bstationary, dn_b_stationary=dn_bstationary, dn_herd_m=dn_herd_m,
+                dn_tile_m=dn_tile_m, dn_tile_n=dn_tile_n, dup=offn_dup, gu_swiglu=gu_swiglu,
             ),
             {**o_ffn_backend, "instance_name": "o_ffn_fused_gu"},
         )
@@ -294,6 +297,7 @@ def compile_backbone_kernels(
 
 def run_transformer_block_custom(
     x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_idx=0, fused_qkv=False, fused_gu=False,
+    gu_swiglu_half=0,
 ):
     """Same as llama32_1b_prefill.run_transformer_block, but either or both
     halves can use a fused-launch variant:
@@ -392,9 +396,16 @@ def run_transformer_block_custom(
         gu_n = 2 * hidden_dim
         _offn_key = f"o_ffn_fused_gu_L{layer_idx}"
         if _offn_key not in _arg_cache:
-            w_gateup = np.ascontiguousarray(
-                np.concatenate([layer_weights.w_gate, layer_weights.w_up], axis=1)
-            ).astype(bfloat16)
+            if gu_swiglu_half:
+                from o_ffn_fused_gu import interleave_gate_up
+
+                w_gateup = interleave_gate_up(
+                    np.asarray(layer_weights.w_gate), np.asarray(layer_weights.w_up), gu_swiglu_half
+                ).astype(bfloat16)
+            else:
+                w_gateup = np.ascontiguousarray(
+                    np.concatenate([layer_weights.w_gate, layer_weights.w_up], axis=1)
+                ).astype(bfloat16)
             offn_args = [
                 None,
                 np.asarray(layer_weights.wo, dtype=bfloat16).reshape(emb_dim, emb_dim),
@@ -497,7 +508,48 @@ def main():
     ap.add_argument("--qkv-bstationary", action="store_true")
     ap.add_argument("--od-bstationary", action="store_true", help="O/Down GEMMs bypass registry, full-K + B-stationary")
     ap.add_argument("--od-tile-n", type=int, default=48)
+    ap.add_argument("--o-bstationary", action="store_true", help="O GEMM only: full-K + B-stationary")
+    ap.add_argument("--dn-bstationary", action="store_true", help="Down GEMM only: full-K + B-stationary")
+    ap.add_argument("--dn-herd-m", type=int, default=None, help="herd_m for the B-stationary Down GEMM")
+    ap.add_argument("--dn-tile-m", type=int, default=32)
+    ap.add_argument("--dn-tile-n", type=int, default=None, help="default: --od-tile-n")
+    ap.add_argument("--gu-swiglu", action="store_true",
+                    help="fold SwiGLU into the fused GateUp GEMM's drain (needs --fused-gu)")
+    ap.add_argument("--compile-only", action="store_true")
+    ap.add_argument("--save-out", default="", help="np.save every layer's NPU output (float32) here")
+    ap.add_argument("--dup", default="", help="timing probe: comma list of o_ffn slice prefixes to run twice "
+                    "(og,ra,rm,gu,sw,dg,fa)")
     args = ap.parse_args()
+    offn_dup = tuple(p for p in args.dup.split(",") if p)
+    o_bst = args.od_bstationary or args.o_bstationary
+    dn_bst = args.od_bstationary or args.dn_bstationary
+
+    hm_tag = f"_hm{args.herd_m}" if args.herd_m else ""
+    od_tag = (
+        (f"o{args.od_tile_n}" if o_bst else "")
+        + (f"dn{args.dn_tile_m}x{args.dn_tile_n or args.od_tile_n}hm{args.dn_herd_m or 'a'}" if dn_bst else "")
+    )
+    dup_tag = f"dup{'-'.join(offn_dup)}" if offn_dup else ""
+    assert not args.gu_swiglu or args.fused_gu, "--gu-swiglu needs --fused-gu"
+    sw_tag = "sw" if args.gu_swiglu else ""
+    gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{sw_tag}{od_tag}{dup_tag}" if args.fused_gu else ""
+    qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
+    cache_dir = str(Path(__file__).resolve().parent / "build" / f"backbone_npu_cache{hm_tag}{gu_tag}{qkv_tag}")
+    from shared.infra.cache import KernelCache, Profiler
+
+    cache = KernelCache(cache_dir, verbose=False, profiler=Profiler(enabled=True))
+    print(f"Compiling kernels (seq_len=256, herd_m={args.herd_m or 'auto'}, "
+          f"fused_gu={args.fused_gu}, fused_qkv={args.fused_qkv}) -> {cache_dir}")
+    compile_backbone_kernels(
+        cache, BACKBONE_CONFIG, SEQ_PAD, herd_m_override=args.herd_m,
+        fused_gu=args.fused_gu, gu_tile_n=args.gu_tile_n,
+        fused_qkv=args.fused_qkv, qkv_tile_n=args.qkv_tile_n,
+        gu_bstationary=args.gu_bstationary, qkv_bstationary=args.qkv_bstationary,
+        od_tile_n=args.od_tile_n, o_bstationary=o_bst, dn_bstationary=dn_bst, dn_herd_m=args.dn_herd_m,
+        dn_tile_m=args.dn_tile_m, dn_tile_n=args.dn_tile_n, offn_dup=offn_dup, gu_swiglu=args.gu_swiglu,
+    )
+    if args.compile_only:
+        return
 
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
@@ -512,22 +564,6 @@ def main():
     print(f"hidden_in: {layer0['hidden_in'].shape}, position_ids: {layer0['position_ids'].shape}, "
           f"mask: {layer0['attention_mask'].shape}")
 
-    hm_tag = f"_hm{args.herd_m}" if args.herd_m else ""
-    gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{'od' if args.od_bstationary else ''}" if args.fused_gu else ""
-    qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
-    cache_dir = str(Path(__file__).resolve().parent / "build" / f"backbone_npu_cache{hm_tag}{gu_tag}{qkv_tag}")
-    from shared.infra.cache import KernelCache, Profiler
-
-    cache = KernelCache(cache_dir, verbose=False, profiler=Profiler(enabled=True))
-    print(f"Compiling kernels (seq_len=256, herd_m={args.herd_m or 'auto'}, "
-          f"fused_gu={args.fused_gu}, fused_qkv={args.fused_qkv})...")
-    compile_backbone_kernels(
-        cache, BACKBONE_CONFIG, SEQ_PAD, herd_m_override=args.herd_m,
-        fused_gu=args.fused_gu, gu_tile_n=args.gu_tile_n,
-        fused_qkv=args.fused_qkv, qkv_tile_n=args.qkv_tile_n,
-        gu_bstationary=args.gu_bstationary, qkv_bstationary=args.qkv_bstationary,
-        od_bstationary=args.od_bstationary, od_tile_n=args.od_tile_n,
-    )
     prefill.attention_reference = _patched_attention_reference
 
     mask_padded = pad_mask(layer0["attention_mask"].astype(bool), SEQ_PAD)
@@ -546,6 +582,7 @@ def main():
             return run_transformer_block_custom(
                 xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache, layer_idx=i,
                 fused_qkv=args.fused_qkv, fused_gu=args.fused_gu,
+                gu_swiglu_half=args.gu_tile_n // 2 if args.gu_swiglu else 0,
             )
         out, _inter = prefill.run_transformer_block(
             xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache,
@@ -553,21 +590,33 @@ def main():
         )
         return out
 
-    npu_outputs = {}
-    for i in range(args.layers):
-        out = run_one_layer(x, i, verbose=(i == 0))
-        npu_outputs[i] = out
-        x = out
+    def _cos(a, b):
+        a, b = a.ravel().astype(np.float64), b.ravel().astype(np.float64)
+        return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
 
-    # Correctness: compare layer 0's NPU-path output (still bit-identical-ish
-    # modulo bf16) against the REAL captured output for layer 0.
-    npu0 = np.asarray(npu_outputs[0][:SEQ_REAL], dtype=np.float32)
+    # run_one_layer returns views into shared_nonstatic BOs that the next call
+    # overwrites, so every kept output must be copied.
+    npu_outputs, npu_isolated = {}, {}
+    for i in range(args.layers):
+        out = np.array(run_one_layer(x, i, verbose=(i == 0)), dtype=np.float32)
+        npu_outputs[i] = out
+        x = out.astype(bfloat16)
+    for i in range(args.layers):
+        xi = pad_seq(per_layer[i]["hidden_in"].astype(bfloat16), SEQ_PAD)
+        npu_isolated[i] = np.array(run_one_layer(xi, i), dtype=np.float32)
+
+    if args.save_out:
+        np.save(args.save_out, np.stack([np.stack([npu_outputs[i], npu_isolated[i]]) for i in range(args.layers)]))
+
+    print("\nPer-layer cosine vs real lerobot backbone (chained = NPU output feeds next layer; "
+          "isolated = real input per layer):")
+    for i in range(args.layers):
+        real = real_outputs[i].astype(np.float32)
+        print(f"  L{i:2d}  chained {_cos(npu_outputs[i][:SEQ_REAL], real):.6f}  "
+              f"isolated {_cos(npu_isolated[i][:SEQ_REAL], real):.6f}")
+    npu0 = npu_outputs[0][:SEQ_REAL]
     real0 = real_outputs[0].astype(np.float32)
-    cos = float(
-        np.dot(npu0.ravel(), real0.ravel())
-        / (np.linalg.norm(npu0.ravel()) * np.linalg.norm(real0.ravel()) + 1e-9)
-    )
-    print(f"\nLayer 0 cosine (NPU-path vs real lerobot backbone): {cos:.6f}")
+    print(f"\nLayer 0 cosine (NPU-path vs real lerobot backbone): {_cos(npu0, real0):.6f}")
     print(f"  npu0 mean/std: {npu0.mean():.4f}/{npu0.std():.4f}  real0 mean/std: {real0.mean():.4f}/{real0.std():.4f}")
 
     if args.profile:
