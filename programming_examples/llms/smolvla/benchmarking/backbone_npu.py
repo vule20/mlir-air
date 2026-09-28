@@ -260,6 +260,7 @@ def compile_backbone_kernels(
     fused_qkv=False, qkv_tile_n=80, gu_bstationary=False, qkv_bstationary=False,
     od_bstationary=False, od_tile_n=80, o_bstationary=None, dn_bstationary=None, dn_herd_m=None,
     dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False, npu_attn=False, fused_layer=False, fa_opt="-O2", layers_per_call=1,
+    fa_his=1, fa_qb=False,
 ):
     """Replacement for llama32_1b_prefill.compile_all_kernels: that function
     hardcodes mm.o pre-compiles at tile_n=128 (llama32_1b's own registry
@@ -352,7 +353,8 @@ def compile_backbone_kernels(
                               num_q_tiles=seq_len // hd, num_cascade_stages=seq_len // hd,
                               num_heads=config.n_heads, num_kv_heads=config.n_kv_heads,
                               num_heads_per_unroll=1, causal=False, attn_mask=True,
-                              v_cols=config.emb_dim + 2 * kv_dim)
+                              v_cols=config.emb_dim + 2 * kv_dim, heads_in_segment=fa_his,
+                              q_bcast=fa_qb)
         cache.compile_and_cache("flash_attn", fa_mod, {**_FA_BACKEND, "verbose": cache.verbose})
     if fused_layer:
         from layer_fused import build_layer_module
@@ -702,6 +704,9 @@ def main():
     ap.add_argument("--layers-per-call", type=int, default=1,
                     help="with --fused-layer: stitch this many layers into one ELF (one XRT run)")
     ap.add_argument("--fa-opt", default="-O2", help="Peano optimization level for attn_npu2.o (e.g. -Os)")
+    ap.add_argument("--fa-his", type=int, default=1,
+                    help="FA heads_in_segment: heads looped inside the segment per launch iteration")
+    ap.add_argument("--fa-qb", action="store_true", help="FA q_bcast: Q on its own per-column channel")
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--save-out", default="", help="np.save every layer's NPU output (float32) here")
     ap.add_argument("--dup", default="", help="timing probe: comma list of o_ffn slice prefixes to run twice "
@@ -735,6 +740,10 @@ def main():
     bfp_tag = "".join(f"_b{k}{'x'.join(map(str, v))}" for k, v in _BFP16.items())
     if args.fa_opt != "-O2":
         bfp_tag += f"_fa{args.fa_opt.lstrip('-')}"
+    if args.fa_his > 1:
+        bfp_tag += f"_his{args.fa_his}"
+    if args.fa_qb:
+        bfp_tag += "_qb"
     sw_tag = "sw" if args.gu_swiglu else ""
     gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{sw_tag}{od_tag}{dup_tag}" if args.fused_gu else ""
     qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
@@ -757,7 +766,7 @@ def main():
         od_tile_n=args.od_tile_n, o_bstationary=o_bst, dn_bstationary=dn_bst, dn_herd_m=args.dn_herd_m,
         dn_tile_m=args.dn_tile_m, dn_tile_n=args.dn_tile_n, offn_dup=offn_dup, gu_swiglu=args.gu_swiglu,
         npu_attn=args.npu_attn, fused_layer=args.fused_layer, fa_opt=args.fa_opt,
-        layers_per_call=args.layers_per_call,
+        layers_per_call=args.layers_per_call, fa_his=args.fa_his, fa_qb=args.fa_qb,
     )
     for name, override in (("o_ffn", args.offn_elf), ("rms_gemms_rope", args.rgr_elf)):
         if override:

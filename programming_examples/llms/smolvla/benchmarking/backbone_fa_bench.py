@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--lqp", type=int, default=256)
     ap.add_argument("--nq", type=int, default=4, help="num_q_tiles")
     ap.add_argument("--opt", default="-O2", help="Peano opt level for attn_npu2.o (e.g. -Os: smaller core programs)")
+    ap.add_argument("--his", type=int, default=1, help="heads_in_segment: head groups looped in the segment per wave")
+    ap.add_argument("--qb", action="store_true", help="q_bcast: Q on its own per-column channel")
     args = ap.parse_args()
     tiling = [int(t) for t in args.tiling.split(",")]
     global NH, NKV
@@ -73,12 +75,14 @@ def main():
     tag = (f"hpu{args.hpu}_bfp{args.bfp16}_pp{args.pingpong or 'on'}_t{'x'.join(map(str, tiling))}"
            + ("_mask" if args.mask else "") + ("" if (NH, NKV) == (15, 5) else f"_h{NH}x{NKV}")
            + ("" if args.opt == "-O2" else args.opt.replace("-", "_"))
-           + ("" if (args.lqp, args.nq) == (256, 4) else f"_lqp{args.lqp}nq{args.nq}"))
+           + ("" if (args.lqp, args.nq) == (256, 4) else f"_lqp{args.lqp}nq{args.nq}")
+           + (f"_his{args.his}" if args.his > 1 else "") + ("_qb" if args.qb else ""))
     cache = KernelCache(str(_HERE / "build" / f"backbone_fa_{tag}"),
                         verbose=False, profiler=Profiler(enabled=True))
     mod = build_module(lk=SEQ, lkp=HD, lq=SEQ, lqp=args.lqp, dk=HD, dv=HD, num_q_tiles=args.nq,
                        num_cascade_stages=4, num_heads=NH, num_kv_heads=NKV, causal=False,
-                       num_heads_per_unroll=args.hpu, attn_mask=bool(args.mask))
+                       num_heads_per_unroll=args.hpu, attn_mask=bool(args.mask),
+                       heads_in_segment=args.his, q_bcast=args.qb)
     import shared.infra.external_kernels as ek
 
     ek._PEANO_FLAGS = [args.opt if f == "-O2" else f for f in ek._PEANO_FLAGS]
