@@ -135,6 +135,9 @@ def masked_attention_reference(q, k, v, n_heads, n_kv_heads, mask_bool):
 
 
 _MASK_HOLDER = {"mask": None}
+# runtime_loop_tiling_sizes of the fused rms_gemms_rope / o_ffn ELFs, shared by
+# compile and load (main() overrides from --rgr-tiling / --offn-tiling).
+_TILING = {"rgr": [2, 2], "offn": [2, 2]}
 
 
 def _patched_attention_reference(q, k, v, n_heads, n_kv_heads):
@@ -254,7 +257,7 @@ def compile_backbone_kernels(
                 b_stationary=qkv_bstationary,
             ),
             {"verbose": cache.verbose, "omit_while_true_loop": False, "output_format": "elf",
-             "instance_name": "rms_gemms_rope_fused_qkv", "runtime_loop_tiling_sizes": [2, 2]},
+             "instance_name": "rms_gemms_rope_fused_qkv", "runtime_loop_tiling_sizes": _TILING["rgr"]},
         )
     else:
         cache.compile_and_cache(
@@ -272,6 +275,8 @@ def compile_backbone_kernels(
         "instance_name": "o_ffn",
         "runtime_loop_tiling_sizes": [2, 2],
     }
+    fused_offn_backend = {**o_ffn_backend, "instance_name": "o_ffn_fused_gu",
+                          "runtime_loop_tiling_sizes": _TILING["offn"]}
     if fused_gu:
         from o_ffn_fused_gu import build_o_ffn_module_fused_gu
 
@@ -283,7 +288,7 @@ def compile_backbone_kernels(
                 o_b_stationary=o_bstationary, dn_b_stationary=dn_bstationary, dn_herd_m=dn_herd_m,
                 dn_tile_m=dn_tile_m, dn_tile_n=dn_tile_n, dup=offn_dup, gu_swiglu=gu_swiglu,
             ),
-            {**o_ffn_backend, "instance_name": "o_ffn_fused_gu"},
+            fused_offn_backend,
         )
     else:
         cache.compile_and_cache(
@@ -343,7 +348,8 @@ def run_transformer_block_custom(
 
         results = cache.load_and_run(
             "rms_gemms_rope", {"verbose": False, "omit_while_true_loop": False, "output_format": "elf",
-                               "instance_name": "rms_gemms_rope_fused_qkv", "runtime_loop_tiling_sizes": [2, 2]},
+                               "instance_name": "rms_gemms_rope_fused_qkv",
+                               "runtime_loop_tiling_sizes": _TILING["rgr"]},
             *cached_args, output_indices=[4, 6, 8], static_input_indices={1, 3, 5, 7},
             intermediate_indices={2, 4, 6, 8}, bo_key=_rms_key, shared_nonstatic=True,
         )
@@ -430,7 +436,7 @@ def run_transformer_block_custom(
         _inter = {2, 4, 6, 8, 9, 11, 12}
         results = cache.load_and_run(
             "o_ffn", {"verbose": False, "omit_while_true_loop": False, "output_format": "elf",
-                      "instance_name": "o_ffn_fused_gu", "runtime_loop_tiling_sizes": [2, 2]},
+                      "instance_name": "o_ffn_fused_gu", "runtime_loop_tiling_sizes": _TILING["offn"]},
             *cached_args, output_indices=[_out_idx], static_input_indices={1, 5, 7, 10},
             intermediate_indices=_inter, bo_key=_offn_key, shared_nonstatic=True,
         )
@@ -515,6 +521,10 @@ def main():
     ap.add_argument("--dn-tile-n", type=int, default=None, help="default: --od-tile-n")
     ap.add_argument("--gu-swiglu", action="store_true",
                     help="fold SwiGLU into the fused GateUp GEMM's drain (needs --fused-gu)")
+    ap.add_argument("--rgr-tiling", default="2,2", help="runtime_loop_tiling_sizes of fused rms_gemms_rope")
+    ap.add_argument("--offn-tiling", default="2,2", help="runtime_loop_tiling_sizes of fused o_ffn")
+    ap.add_argument("--offn-elf", default="", help="replace the compiled o_ffn.elf with this prebuilt ELF")
+    ap.add_argument("--rgr-elf", default="", help="replace the compiled rms_gemms_rope.elf with this prebuilt ELF")
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--save-out", default="", help="np.save every layer's NPU output (float32) here")
     ap.add_argument("--dup", default="", help="timing probe: comma list of o_ffn slice prefixes to run twice "
@@ -534,7 +544,12 @@ def main():
     sw_tag = "sw" if args.gu_swiglu else ""
     gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{sw_tag}{od_tag}{dup_tag}" if args.fused_gu else ""
     qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
-    cache_dir = str(Path(__file__).resolve().parent / "build" / f"backbone_npu_cache{hm_tag}{gu_tag}{qkv_tag}")
+    _TILING["rgr"] = [int(t) for t in args.rgr_tiling.split(",")]
+    _TILING["offn"] = [int(t) for t in args.offn_tiling.split(",")]
+    tl_tag = "".join(
+        f"_{k}t{'x'.join(map(str, v))}" for k, v in _TILING.items() if v != [2, 2]
+    )
+    cache_dir = str(Path(__file__).resolve().parent / "build" / f"backbone_npu_cache{hm_tag}{gu_tag}{qkv_tag}{tl_tag}")
     from shared.infra.cache import KernelCache, Profiler
 
     cache = KernelCache(cache_dir, verbose=False, profiler=Profiler(enabled=True))
@@ -548,6 +563,12 @@ def main():
         od_tile_n=args.od_tile_n, o_bstationary=o_bst, dn_bstationary=dn_bst, dn_herd_m=args.dn_herd_m,
         dn_tile_m=args.dn_tile_m, dn_tile_n=args.dn_tile_n, offn_dup=offn_dup, gu_swiglu=args.gu_swiglu,
     )
+    for name, override in (("o_ffn", args.offn_elf), ("rms_gemms_rope", args.rgr_elf)):
+        if override:
+            import shutil
+
+            shutil.copy2(override, cache.artifacts[name].output_binary)
+            print(f"  {name}: using prebuilt {override}")
     if args.compile_only:
         return
 
