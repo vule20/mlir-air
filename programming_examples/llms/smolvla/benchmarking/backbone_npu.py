@@ -153,6 +153,22 @@ _LAYER_BACKEND = {"verbose": False, "omit_while_true_loop": False, "output_forma
                   "instance_name": "layer", "runtime_loop_tiling_sizes": []}
 
 
+# GEMMs taking bfp16ebs8 weights -> (tile_n, tile_k_l2, tile_k_l1) (main() fills from --bfp16).
+_BFP16 = {}
+_BFP16_TILES = {"qkv": (80, 320, 64), "o": (80, 960, 64), "gu": (128, 320, 64), "dn": (80, 640, 64)}
+
+
+def _weight(key, w):
+    """bf16 [K, N] weight -> what the GEMM `key` consumes (packed bfp16ebs8 if enabled)."""
+    w = np.ascontiguousarray(np.asarray(w, dtype=bfloat16))
+    if key not in _BFP16:
+        return w
+    from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import pack_b_bfp16ebs8
+
+    tn, _, tk1 = _BFP16[key]
+    return pack_b_bfp16ebs8(w, tn, tk1)
+
+
 def additive_attn_mask(mask_bool):
     """bool (True = attend) -> the additive bf16 mask attn_npu2_seqfirst's
     attn_mask=True expects: 0 where kept, bf16 lowest (0xff7f) where dropped.
@@ -275,7 +291,7 @@ def compile_backbone_kernels(
         rgr_mod = build_rms_gemms_rope_module_fused_qkv(
             seq_len, config.emb_dim, config.n_kv_heads * config.head_dim,
             config.n_heads, config.n_kv_heads, config.head_dim, herd_m=gemm_herd_m, qkv_tile_n=qkv_tile_n,
-            b_stationary=qkv_bstationary,
+            b_stationary=qkv_bstationary, bfp16=_BFP16.get("qkv"),
         )
         cache.compile_and_cache(
             "rms_gemms_rope",
@@ -309,6 +325,7 @@ def compile_backbone_kernels(
             gu_b_stationary=gu_bstationary, od_b_stationary=od_bstationary, od_tile_n=od_tile_n,
             o_b_stationary=o_bstationary, dn_b_stationary=dn_bstationary, dn_herd_m=dn_herd_m,
             dn_tile_m=dn_tile_m, dn_tile_n=dn_tile_n, dup=offn_dup, gu_swiglu=gu_swiglu,
+            bfp16={k: v for k, v in _BFP16.items() if k in ("o", "gu", "dn")},
         )
         cache.compile_and_cache("o_ffn", offn_mod, fused_offn_backend)
     else:
@@ -374,9 +391,7 @@ def run_transformer_block_custom(
         qkv_n = emb_dim + 2 * kv_dim
         _rms_key = f"rms_gemms_rope_qkv_L{layer_idx}"
         if _rms_key not in _arg_cache:
-            w_qkv = np.ascontiguousarray(
-                np.concatenate([layer_weights.wq, layer_weights.wk, layer_weights.wv], axis=1)
-            ).astype(bfloat16)
+            w_qkv = _weight("qkv", np.concatenate([layer_weights.wq, layer_weights.wk, layer_weights.wv], axis=1))
             _rms_args = [
                 None,
                 np.asarray(layer_weights.attn_norm, dtype=bfloat16).reshape(emb_dim),
@@ -465,14 +480,13 @@ def run_transformer_block_custom(
 
                 w_gateup = interleave_gate_up(
                     np.asarray(layer_weights.w_gate), np.asarray(layer_weights.w_up), gu_swiglu_half
-                ).astype(bfloat16)
+                )
             else:
-                w_gateup = np.ascontiguousarray(
-                    np.concatenate([layer_weights.w_gate, layer_weights.w_up], axis=1)
-                ).astype(bfloat16)
+                w_gateup = np.concatenate([layer_weights.w_gate, layer_weights.w_up], axis=1)
+            w_gateup = _weight("gu", w_gateup)
             offn_args = [
                 None,
-                np.asarray(layer_weights.wo, dtype=bfloat16).reshape(emb_dim, emb_dim),
+                _weight("o", np.asarray(layer_weights.wo).reshape(emb_dim, emb_dim)),
                 np.zeros((seq_len, emb_dim), dtype=bfloat16),
                 None,
                 np.zeros((seq_len, emb_dim), dtype=bfloat16),
@@ -481,7 +495,7 @@ def run_transformer_block_custom(
                 w_gateup,
                 np.zeros((seq_len, gu_n), dtype=bfloat16),
                 np.zeros((seq_len, hidden_dim), dtype=bfloat16),
-                np.asarray(layer_weights.w_down, dtype=bfloat16).reshape(hidden_dim, emb_dim),
+                _weight("dn", np.asarray(layer_weights.w_down).reshape(hidden_dim, emb_dim)),
                 np.zeros((seq_len, emb_dim), dtype=bfloat16),
                 np.zeros(seq_len * emb_dim, dtype=bfloat16),
             ]
@@ -551,8 +565,8 @@ def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_i
     key = f"layer_L{layer_idx}"
     if key not in _arg_cache:
         lw = layer_weights
-        w_qkv = np.concatenate([lw.wq, lw.wk, lw.wv], axis=1).astype(bfloat16)
-        w_gateup = interleave_gate_up(np.asarray(lw.w_gate), np.asarray(lw.w_up), gu_swiglu_half).astype(bfloat16)
+        w_qkv = _weight("qkv", np.concatenate([lw.wq, lw.wk, lw.wv], axis=1))
+        w_gateup = _weight("gu", interleave_gate_up(np.asarray(lw.w_gate), np.asarray(lw.w_up), gu_swiglu_half))
 
         def z(*shape):
             return np.zeros(shape, dtype=bfloat16)
@@ -564,10 +578,10 @@ def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_i
             np.repeat(rope_lut_bf16[:seq_len], nh, axis=0).flatten(), z(seq_len, emb),
             np.repeat(rope_lut_bf16[:seq_len], nkv, axis=0).flatten(), z(seq_len, kv),
             _NPU_ATTN["mask"], z(seq_len, emb),
-            np.asarray(lw.wo, dtype=bfloat16).reshape(emb, emb), z(seq_len, emb), z(seq_len, emb),
+            _weight("o", np.asarray(lw.wo).reshape(emb, emb)), z(seq_len, emb), z(seq_len, emb),
             np.asarray(lw.ffn_norm, dtype=bfloat16).reshape(emb), z(seq_len, emb),
             w_gateup, z(seq_len, hidden),
-            np.asarray(lw.w_down, dtype=bfloat16).reshape(hidden, emb), z(seq_len, emb),
+            _weight("dn", np.asarray(lw.w_down).reshape(hidden, emb)), z(seq_len, emb),
             z(seq_len * emb),
         ]
     args = _arg_cache[key]
@@ -631,6 +645,9 @@ def main():
     ap.add_argument("--fused-layer", action="store_true",
                     help="whole layer (RMS+QKV+RoPE, FA, O+FFN) as ONE stitched ELF "
                     "(needs --fused-qkv --fused-gu --gu-swiglu --npu-attn)")
+    ap.add_argument("--bfp16", default="",
+                    help="comma list of GEMMs (qkv,o,gu,dn) taking bfp16ebs8 weights; "
+                    "optional tiles as key:tile_n:tile_k_l2:tile_k_l1")
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--save-out", default="", help="np.save every layer's NPU output (float32) here")
     ap.add_argument("--dup", default="", help="timing probe: comma list of o_ffn slice prefixes to run twice "
@@ -650,6 +667,14 @@ def main():
     assert not args.npu_attn or args.fused_qkv, "--npu-attn needs --fused-qkv"
     assert not args.fused_layer or (args.fused_qkv and args.fused_gu and args.gu_swiglu and args.npu_attn), (
         "--fused-layer needs --fused-qkv --fused-gu --gu-swiglu --npu-attn")
+    for spec in filter(None, args.bfp16.split(",")):
+        k, *tiles = spec.split(":")
+        assert k in _BFP16_TILES, f"--bfp16: unknown GEMM {k}"
+        _BFP16[k] = tuple(map(int, tiles)) if tiles else _BFP16_TILES[k]
+    assert "qkv" not in _BFP16 or args.fused_qkv, "--bfp16 qkv needs --fused-qkv"
+    assert not (_BFP16.keys() - {"qkv"}) or args.fused_gu, "--bfp16 o/gu/dn needs --fused-gu"
+    sw_half = (_BFP16["gu"][0] if "gu" in _BFP16 else args.gu_tile_n) // 2
+    bfp_tag = "".join(f"_b{k}{'x'.join(map(str, v))}" for k, v in _BFP16.items())
     sw_tag = "sw" if args.gu_swiglu else ""
     gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{sw_tag}{od_tag}{dup_tag}" if args.fused_gu else ""
     qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
@@ -658,7 +683,7 @@ def main():
     tl_tag = "".join(
         f"_{k}t{'x'.join(map(str, v))}" for k, v in _TILING.items() if v != [2, 2]
     )
-    cache_dir = str(Path(__file__).resolve().parent / "build" / f"backbone_npu_cache{hm_tag}{gu_tag}{qkv_tag}{tl_tag}")
+    cache_dir = str(Path(__file__).resolve().parent / "build" / f"backbone_npu_cache{hm_tag}{gu_tag}{qkv_tag}{tl_tag}{bfp_tag}")
     from shared.infra.cache import KernelCache, Profiler
 
     cache = KernelCache(cache_dir, verbose=False, profiler=Profiler(enabled=True))
@@ -713,12 +738,12 @@ def main():
     def run_one_layer(xx, i, verbose=False):
         if args.fused_layer:
             return run_layer_fused(xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache,
-                                   layer_idx=i, gu_swiglu_half=args.gu_tile_n // 2)
+                                   layer_idx=i, gu_swiglu_half=sw_half)
         if args.fused_gu or args.fused_qkv:
             return run_transformer_block_custom(
                 xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache, layer_idx=i,
                 fused_qkv=args.fused_qkv, fused_gu=args.fused_gu,
-                gu_swiglu_half=args.gu_tile_n // 2 if args.gu_swiglu else 0,
+                gu_swiglu_half=sw_half if args.gu_swiglu else 0,
             )
         out, _inter = prefill.run_transformer_block(
             xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache,

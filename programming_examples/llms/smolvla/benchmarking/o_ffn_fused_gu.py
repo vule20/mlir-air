@@ -115,7 +115,7 @@ def _compile_mm_swiglu(tile_m, tile_n, tile_k_l1, sym_suffix, out_name):
 def build_o_ffn_module_fused_gu(
     seq_len, emb_dim, hidden_dim, herd_m=4, herd_n=4, print_kernels=False, gu_tile_n=80, gu_b_stationary=False,
     od_b_stationary=False, od_tile_n=80, o_b_stationary=None, dn_b_stationary=None, dn_herd_m=None,
-    dn_tile_m=32, dn_tile_n=None, dup=(), gu_swiglu=False,
+    dn_tile_m=32, dn_tile_n=None, dup=(), gu_swiglu=False, bfp16=None,
 ):
     """O-proj + Residual + FFN with Gate+Up fused into one GEMM.
 
@@ -133,7 +133,12 @@ def build_o_ffn_module_fused_gu(
       %arg10 w_down      (hidden_dim, emb_dim)
       %arg11 down        (seq_len, emb_dim)                Down-GEMM output
       %arg12 output      (seq_len*emb_dim,)                FFN Add output
+
+    bfp16: {"o" | "gu" | "dn": (tile_n, tile_k_l2, tile_k_l1)} -- those GEMMs
+    take bfp16ebs8 weights (gemm_bfp16.py) and their weight arg is the packed
+    matrix (pack_b_bfp16ebs8; w_gateup interleaved first when gu_swiglu).
     """
+    bfp16 = bfp16 or {}
     from shared.builders.gemm_builder import _build_gemm_module, gemm_registry_config, disambiguate_by_tile_n
     from shared.infra.external_kernels import compile_gemm_mm
     from weighted_rms_norm.weighted_rms_norm import build_module as build_rms
@@ -151,7 +156,23 @@ def build_o_ffn_module_fused_gu(
     dn_herd_m = dn_herd_m or herd_m
     dn_tile_n = dn_tile_n or od_tile_n
 
-    if o_b_stationary:
+    w_types = {"o": f"memref<{emb_dim}x{emb_dim}xbf16>", "gu": f"memref<{emb_dim}x{2 * hidden_dim}xbf16>",
+               "dn": f"memref<{hidden_dim}x{emb_dim}xbf16>"}
+    if bfp16:
+        from gemm_bfp16 import bfp16_extern_syms, bfp16_weight_type, build_gemm_bfp16, compile_mm_bfp16
+
+        def _bfp16_gemm(key, k, n, swiglu=False):
+            tn, tk2, tk1 = bfp16[key]
+            sfx, obj = f"_{key}b", f"mm_{key}b.o"
+            print(f"  {key} GEMM, bfp16 weights (tile_n {tn}, K {tk2}x{tk1}{', SwiGLU drain' if swiglu else ''})...")
+            compile_mm_bfp16(32, tn, tk1, sfx, obj)
+            w_types[key] = bfp16_weight_type(k, n, tn, tk1)
+            ir = str(build_gemm_bfp16(seq_len, k, n, 32, tk2, tk1, tn, herd_m, herd_n, sfx, obj, swiglu=swiglu))
+            return ir, bfp16_extern_syms(sfx, swiglu)
+
+    if "o" in bfp16:
+        o_ir, o_extern_syms = _bfp16_gemm("o", emb_dim, emb_dim)
+    elif o_b_stationary:
         # Bypass the registry (tile_k_l2=320, not full-K) with explicit
         # full-K + b_stationary=True, same lever as the QKV/GateUp fusions.
         print("  [1/7] O GEMM, B-stationary (drain)...")
@@ -184,29 +205,35 @@ def build_o_ffn_module_fused_gu(
     # (backbone_qkv_fusion_ab.py FUSED_GU: -10.4% vs 2 separate launches).
     gu_n = 2 * hidden_dim
     gu_tile_k1 = 32
-    if gu_swiglu:
-        # w_gateup must be block-interleaved on the host (interleave_gate_up with
-        # half=gu_tile_n//2); the GEMM then writes SiLU(gate)*up straight to arg9.
-        print("  [4/7] GateUp GEMM, fused, SwiGLU drain epilogue...")
-        _compile_mm_swiglu(32, gu_tile_n, gu_tile_k1, "_gu", "mm_gu_sw.o")
-        gu_link, gu_drain_sym = "mm_gu_sw.o", "@f32_to_bf16_swiglu_mn_gu"
+    if "gu" in bfp16:
+        gu_ir, gu_extern_syms = _bfp16_gemm("gu", emb_dim, gu_n, swiglu=gu_swiglu)
     else:
-        print("  [4/7] GateUp GEMM, fused (drain)...")
-        compile_gemm_mm(tile_m=32, tile_n=gu_tile_n, tile_k_l1=gu_tile_k1, sym_suffix="_gu", out_name="mm_gu.o")
-        gu_link, gu_drain_sym = "mm_gu.o", "@f32_to_bf16_mn_gu"
-    gu_ir = str(
-        _build_gemm_module(
-            seq_len, emb_dim, gu_n, 32, emb_dim, gu_tile_k1, gu_tile_n, herd_m, herd_n,
-            external_bf16_out=True, sym_suffix="_gu", link_with_name=gu_link,
-            b_stationary=gu_b_stationary, epilogue_swiglu=gu_swiglu,
+        if gu_swiglu:
+            # w_gateup must be block-interleaved on the host (interleave_gate_up with
+            # half=gu_tile_n//2); the GEMM then writes SiLU(gate)*up straight to arg9.
+            print("  [4/7] GateUp GEMM, fused, SwiGLU drain epilogue...")
+            _compile_mm_swiglu(32, gu_tile_n, gu_tile_k1, "_gu", "mm_gu_sw.o")
+            gu_link, gu_drain_sym = "mm_gu_sw.o", "@f32_to_bf16_swiglu_mn_gu"
+        else:
+            print("  [4/7] GateUp GEMM, fused (drain)...")
+            compile_gemm_mm(tile_m=32, tile_n=gu_tile_n, tile_k_l1=gu_tile_k1, sym_suffix="_gu", out_name="mm_gu.o")
+            gu_link, gu_drain_sym = "mm_gu.o", "@f32_to_bf16_mn_gu"
+        gu_ir = str(
+            _build_gemm_module(
+                seq_len, emb_dim, gu_n, 32, emb_dim, gu_tile_k1, gu_tile_n, herd_m, herd_n,
+                external_bf16_out=True, sym_suffix="_gu", link_with_name=gu_link,
+                b_stationary=gu_b_stationary, epilogue_swiglu=gu_swiglu,
+            )
         )
-    )
+        gu_extern_syms = {"@matmul_bf16", "@op_has_no_registered_library_name_gu", "@zero_f32_mn_gu", gu_drain_sym}
 
     if not gu_swiglu:
         print("  [5/7] SwiGLU (from fused GateUp buffer)...")
         swiglu_ir = _wrap_ir_in_launch(str(_build_swiglu_from_wide(seq_len, hidden_dim, bfloat16, herd_x=8)))
 
-    if dn_b_stationary:
+    if "dn" in bfp16:
+        down_ir, down_extern_syms = _bfp16_gemm("dn", hidden_dim, emb_dim)
+    elif dn_b_stationary:
         # Memtile budget per herd column (512 KB): B slab K*tile_n + 2x ping-pong
         # A tile_m*K + C. At K=2560, tile_m=32 overflows at any tile_n >= 40.
         print(f"  [6/7] Down GEMM, B-stationary (drain, tile_m={dn_tile_m}, tile_n={dn_tile_n}, herd_m={dn_herd_m})...")
@@ -248,20 +275,18 @@ def build_o_ffn_module_fused_gu(
             return {0: in_idx, 1: w_idx, 2: sc, 3: out_idx}
         return {0: in_idx, 1: w_idx, 2: out_idx}
 
-    gu_extern_syms = {"@matmul_bf16", "@op_has_no_registered_library_name_gu", "@zero_f32_mn_gu", gu_drain_sym}
-
     base_args = [
         FuncArg("%arg0", f"memref<{seq_len}x{emb_dim}xbf16>"),
-        FuncArg("%arg1", f"memref<{emb_dim}x{emb_dim}xbf16>"),
+        FuncArg("%arg1", w_types["o"]),
         FuncArg("%arg2", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg3", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg4", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg5", f"memref<{emb_dim}xbf16>"),
         FuncArg("%arg6", f"memref<{seq_len}x{emb_dim}xbf16>"),
-        FuncArg("%arg7", f"memref<{emb_dim}x{gu_n}xbf16>"),
+        FuncArg("%arg7", w_types["gu"]),
         FuncArg("%arg8", f"memref<{seq_len}x{gu_n}xbf16>"),
         FuncArg("%arg9", f"memref<{seq_len}x{hidden_dim}xbf16>"),
-        FuncArg("%arg10", f"memref<{hidden_dim}x{emb_dim}xbf16>"),
+        FuncArg("%arg10", w_types["dn"]),
         FuncArg("%arg11", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg12", f"memref<{n_total}xbf16>"),
     ]

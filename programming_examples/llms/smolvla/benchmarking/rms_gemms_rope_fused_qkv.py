@@ -30,7 +30,7 @@ from rope_from_wide import build_rope_from_wide
 
 def build_rms_gemms_rope_module_fused_qkv(
     seq_len, emb_dim, kv_dim, n_heads, n_kv_heads, head_dim, herd_m=4, herd_n=4,
-    qkv_tile_n=80, print_kernels=False, b_stationary=False,
+    qkv_tile_n=80, print_kernels=False, b_stationary=False, bfp16=None,
 ):
     """RMSNorm + fused QKV GEMM + RoPE-Q-from-wide + RoPE-K-from-wide.
 
@@ -47,6 +47,9 @@ def build_rms_gemms_rope_module_fused_qkv(
 
     V has no RoPE -- read it directly from the returned qkv buffer's columns
     [emb_dim+kv_dim : emb_dim+2*kv_dim] host-side, no launch needed.
+
+    bfp16=(tile_n, tile_k_l2, tile_k_l1): the QKV GEMM takes bfp16ebs8 weights
+    (gemm_bfp16.py); %arg3 is then the packed w_qkv (pack_b_bfp16ebs8).
     """
     from shared.builders.gemm_builder import _build_gemm_module
     from shared.infra.external_kernels import compile_gemm_mm
@@ -57,15 +60,28 @@ def build_rms_gemms_rope_module_fused_qkv(
     print("  [1/4] RMSNorm...")
     rms_ir = _wrap_ir_in_launch(str(build_rms(seq_len, emb_dim, bfloat16, 16, herd_x=8)))
 
-    print("  [2/4] QKV GEMM, fused (drain)...")
-    compile_gemm_mm(tile_m=32, tile_n=qkv_tile_n, tile_k_l1=32, sym_suffix="_qkv", out_name="mm_qkv.o")
-    qkv_ir = str(
-        _build_gemm_module(
-            seq_len, emb_dim, qkv_n, 32, emb_dim, 32, qkv_tile_n, herd_m, herd_n,
-            external_bf16_out=True, sym_suffix="_qkv", link_with_name="mm_qkv.o",
-            b_stationary=b_stationary,
+    w_qkv_type = f"memref<{emb_dim}x{qkv_n}xbf16>"
+    if bfp16:
+        from gemm_bfp16 import bfp16_extern_syms, bfp16_weight_type, build_gemm_bfp16, compile_mm_bfp16
+
+        tn, tk2, tk1 = bfp16
+        print(f"  [2/4] QKV GEMM, fused, bfp16 weights (tile_n {tn}, K {tk2}x{tk1})...")
+        compile_mm_bfp16(32, tn, tk1, "_qkvb", "mm_qkvb.o")
+        qkv_ir = str(build_gemm_bfp16(seq_len, emb_dim, qkv_n, 32, tk2, tk1, tn, herd_m, herd_n, "_qkvb", "mm_qkvb.o"))
+        qkv_extern_syms = bfp16_extern_syms("_qkvb")
+        w_qkv_type = bfp16_weight_type(emb_dim, qkv_n, tn, tk1)
+    else:
+        print("  [2/4] QKV GEMM, fused (drain)...")
+        compile_gemm_mm(tile_m=32, tile_n=qkv_tile_n, tile_k_l1=32, sym_suffix="_qkv", out_name="mm_qkv.o")
+        qkv_ir = str(
+            _build_gemm_module(
+                seq_len, emb_dim, qkv_n, 32, emb_dim, 32, qkv_tile_n, herd_m, herd_n,
+                external_bf16_out=True, sym_suffix="_qkv", link_with_name="mm_qkv.o",
+                b_stationary=b_stationary,
+            )
         )
-    )
+        qkv_extern_syms = {"@matmul_bf16", "@op_has_no_registered_library_name_qkv", "@zero_f32_mn_qkv",
+                           "@f32_to_bf16_mn_qkv"}
 
     print(f"  [3/4] RoPE Q from wide (cols 0:{emb_dim} of {qkv_n})...")
     rope_q_ir = str(build_rope_from_wide(seq_len, qkv_n, 0, n_heads, head_dim, bfloat16, herd_x=8))
@@ -78,13 +94,11 @@ def build_rms_gemms_rope_module_fused_qkv(
             print(f"\n{'='*60}\n  Sub-kernel: {name} ({len(ir.splitlines())} lines)\n{'='*60}")
             print(ir)
 
-    qkv_extern_syms = {"@matmul_bf16", "@op_has_no_registered_library_name_qkv", "@zero_f32_mn_qkv", "@f32_to_bf16_mn_qkv"}
-
     base_args = [
         FuncArg("%arg0", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg1", f"memref<{emb_dim}xbf16>"),
         FuncArg("%arg2", f"memref<{seq_len}x{emb_dim}xbf16>"),
-        FuncArg("%arg3", f"memref<{emb_dim}x{qkv_n}xbf16>"),
+        FuncArg("%arg3", w_qkv_type),
         FuncArg("%arg4", f"memref<{seq_len}x{qkv_n}xbf16>"),
         FuncArg("%arg5", f"memref<{seq_len*n_heads*head_dim}xbf16>"),
         FuncArg("%arg6", f"memref<{seq_len}x{emb_dim}xbf16>"),
