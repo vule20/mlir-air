@@ -57,20 +57,31 @@ def main():
     ap.add_argument("--tiling", default="1,1", help="runtime_loop_tiling_sizes")
     ap.add_argument("--mask", default="", help="bool (241,241) .npy mask (True = attend); "
                     "enables the additive-mask FA variant")
+    ap.add_argument("--heads", default="15,5", help="q_heads,kv_heads (scaling probes)")
+    ap.add_argument("--lqp", type=int, default=256)
+    ap.add_argument("--nq", type=int, default=4, help="num_q_tiles")
+    ap.add_argument("--opt", default="-O2", help="Peano opt level for attn_npu2.o (e.g. -Os: smaller core programs)")
     args = ap.parse_args()
     tiling = [int(t) for t in args.tiling.split(",")]
+    global NH, NKV
+    NH, NKV = (int(h) for h in args.heads.split(","))
 
     from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import build_module
     from shared.infra.cache import KernelCache, Profiler
     from shared.infra.external_kernels import compile_attn_npu2
 
     tag = (f"hpu{args.hpu}_bfp{args.bfp16}_pp{args.pingpong or 'on'}_t{'x'.join(map(str, tiling))}"
-           + ("_mask" if args.mask else ""))
+           + ("_mask" if args.mask else "") + ("" if (NH, NKV) == (15, 5) else f"_h{NH}x{NKV}")
+           + ("" if args.opt == "-O2" else args.opt.replace("-", "_"))
+           + ("" if (args.lqp, args.nq) == (256, 4) else f"_lqp{args.lqp}nq{args.nq}"))
     cache = KernelCache(str(_HERE / "build" / f"backbone_fa_{tag}"),
                         verbose=False, profiler=Profiler(enabled=True))
-    mod = build_module(lk=SEQ, lkp=HD, lq=SEQ, lqp=256, dk=HD, dv=HD, num_q_tiles=4,
+    mod = build_module(lk=SEQ, lkp=HD, lq=SEQ, lqp=args.lqp, dk=HD, dv=HD, num_q_tiles=args.nq,
                        num_cascade_stages=4, num_heads=NH, num_kv_heads=NKV, causal=False,
                        num_heads_per_unroll=args.hpu, attn_mask=bool(args.mask))
+    import shared.infra.external_kernels as ek
+
+    ek._PEANO_FLAGS = [args.opt if f == "-O2" else f for f in ek._PEANO_FLAGS]
     compile_attn_npu2(head_dim=HD, bfp16=bool(args.bfp16), force=True)
     backend = {"verbose": False, "omit_while_true_loop": False, "omit_pingpong": args.pingpong,
                "runtime_loop_tiling_sizes": tiling, "output_format": "elf",

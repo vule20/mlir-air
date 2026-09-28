@@ -335,7 +335,6 @@ def build_launch(
         assert not causal, "attn_mask replaces the causal mask, not both"
         assert n_images == 1, "attn_mask is one [lq, lk] mask"
         assert lk == lkp * num_cascade_stages, "attn_mask needs one K chunk per stage"
-        assert lq == lqp, "attn_mask needs a single q block"
         assert (
             lqp // num_q_tiles == lkp
         ), "attn_mask block must be the [lkp, lkp] G tile"
@@ -461,7 +460,7 @@ def build_launch(
                 if attn_mask:
                     for s in range(NS):
                         qkin[s].put(
-                            MASK[0:lqp, s * lkp : s * lkp + lkp]
+                            MASK[lx * lqp : lx * lqp + lqp, s * lkp : s * lkp + lkp]
                             .reshape(NQ, tile_size_q, 1, lkp)
                             .transpose(0, 2, 1, 3),
                             indices=[head_local],
