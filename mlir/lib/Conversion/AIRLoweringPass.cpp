@@ -1311,6 +1311,121 @@ static SmallVector<Operation *> getLaunchWindow(airrt::WaitAllOp launchEnd) {
   return window;
 }
 
+// Whether a host->device DMA of the window reads a memref one of its drains
+// writes: the launch reads back through host memory what it produced, e.g. a
+// chain of jobs sharing one activation buffer.
+static bool readsBackDrains(ArrayRef<Operation *> window,
+                            ArrayRef<airrt::DmaMemcpyNdOp> drainDmas) {
+  llvm::SmallPtrSet<Value, 4> drained;
+  for (auto dma : drainDmas)
+    drained.insert(dma.getMemref());
+  llvm::SmallPtrSet<Operation *, 16> drains;
+  for (auto dma : drainDmas)
+    drains.insert(dma);
+  for (Operation *op : window) {
+    bool found = false;
+    op->walk([&](airrt::DmaMemcpyNdOp dma) {
+      if (!drains.contains(dma) && drained.contains(dma.getMemref())) {
+        found = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (found)
+      return true;
+  }
+  return false;
+}
+
+// Drain scheduling for a launch that reads back its own drains
+// (readsBackDrains): an input issued after a drain may read what that drain
+// writes, so the drain has to complete first -- deferring every drain wait to
+// the terminator lets such an input read stale host memory. Drains keep their
+// program order. On each shim channel, drains with no DMA between them form a
+// group; group g is awaited right after group g + 1 is armed, i.e. before the
+// inputs following g + 1. Each group is armed before the inputs that drive its
+// producer, and a channel queues at most two groups at once.
+static void orderDrainWaits(ArrayRef<Operation *> window,
+                            ArrayRef<airrt::DmaMemcpyNdOp> drainDmas,
+                            airrt::WaitAllOp launchEnd) {
+  llvm::SmallPtrSet<Operation *, 16> drains;
+  llvm::SmallSetVector<Value, 8> drainTokens;
+  for (auto dma : drainDmas) {
+    drains.insert(dma);
+    drainTokens.insert(dma->getResult(0));
+  }
+  using Group = SmallVector<airrt::DmaMemcpyNdOp>;
+  // Per shim channel: the drains of different channels have unrelated
+  // consumers, and chaining them would stall one channel's inputs on another's
+  // output.
+  llvm::MapVector<Attribute, SmallVector<Group>> groupsPerChannel;
+  llvm::DenseMap<Attribute, unsigned> lastEpoch;
+  unsigned epoch = 0; // bumped by every non-drain op that issues a DMA
+  for (Operation *op : window) {
+    if (drains.contains(op)) {
+      Attribute md = op->getAttr("metadata");
+      auto &groups = groupsPerChannel[md];
+      auto it = lastEpoch.find(md);
+      if (groups.empty() || it == lastEpoch.end() || it->second != epoch)
+        groups.emplace_back();
+      groups.back().push_back(cast<airrt::DmaMemcpyNdOp>(op));
+      lastEpoch[md] = epoch;
+      continue;
+    }
+    bool hasDma = false;
+    op->walk([&](airrt::DmaMemcpyNdOp) {
+      hasDma = true;
+      return WalkResult::interrupt();
+    });
+    epoch += hasDma;
+  }
+
+  for (Operation *op : window) {
+    auto wa = dyn_cast<airrt::WaitAllOp>(op);
+    if (!wa)
+      continue;
+    SmallVector<Value> kept;
+    for (Value v : wa->getOperands())
+      if (!drainTokens.contains(v))
+        kept.push_back(v);
+    if (kept.size() != wa->getNumOperands())
+      wa->setOperands(kept);
+  }
+
+  // air-annotate-append-barrier pairs a drain with the first later read of its
+  // memref, which here is an input of the drain's own group: awaiting the
+  // drain there deadlocks. The group waits below replace that pairing.
+  for (Operation *op : window)
+    op->walk([&](airrt::DmaMemcpyNdOp dma) {
+      dma->removeAttr(air::attrs::AppendBarrier);
+      dma->removeAttr(air::attrs::AwaitAppends);
+    });
+  for (auto dma : drainDmas)
+    dma->setAttr(air::attrs::OrderedDrain, UnitAttr::get(dma->getContext()));
+
+  auto tokens = [](ArrayRef<airrt::DmaMemcpyNdOp> group) {
+    SmallVector<Value> t;
+    for (auto dma : group)
+      t.push_back(dma->getResult(0));
+    return t;
+  };
+  SmallVector<Value> leOps(launchEnd->getOperands().begin(),
+                           launchEnd->getOperands().end());
+  for (auto &kv : groupsPerChannel) {
+    auto &groups = kv.second;
+    for (unsigned g = 0; g + 1 < groups.size(); g++) {
+      OpBuilder b(groups[g + 1].back());
+      b.setInsertionPointAfter(groups[g + 1].back());
+      // No result: a result-less wait_all blocks, one with a result only
+      // joins.
+      airrt::WaitAllOp::create(b, groups[g].front().getLoc(), TypeRange{},
+                               tokens(groups[g]));
+    }
+    llvm::append_range(leOps, tokens(groups.back()));
+  }
+  launchEnd->setOperands(leOps);
+}
+
 // A launch-scope air.channel.get draining an on-device producer to host DDR
 // lowers to a device->host (S2MM) airrt.dma_memcpy_nd. air-dependency cannot
 // model the implicit @channel put->get backpressure across the herd/segment
@@ -1350,6 +1465,11 @@ static void deferDeviceToHostDrainWaits(ModuleOp module) {
           drainDmas.push_back(dma);
     if (drainDmas.empty())
       return;
+
+    if (readsBackDrains(window, drainDmas)) {
+      orderDrainWaits(window, drainDmas, launchEnd);
+      return;
+    }
 
     // Every drain below is armed at the front and retired at the terminator, so
     // a shim channel holds all of its drains in its task queue at once. The

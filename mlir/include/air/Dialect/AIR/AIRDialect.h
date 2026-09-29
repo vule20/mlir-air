@@ -41,6 +41,10 @@ namespace attrs {
 constexpr StringLiteral RuntimeHoist = "air.runtime_hoist";
 constexpr StringLiteral AwaitAppends = "air.await_appends";
 constexpr StringLiteral AppendBarrier = "air.append_barrier";
+// Marker on a device->host drain of a launch that reads its drains back
+// through host memory (air-to-std): the drain and the await air-to-std placed
+// on it stay in front of the next input feed when the feeds are interleaved.
+constexpr StringLiteral OrderedDrain = "air.ordered_drain";
 constexpr StringLiteral PreserveShimDmaOrder = "air.preserve_shim_dma_order";
 // Marker on a shim MM2S configure task produced by the coalesce-shim-dma merge:
 // its BD covers a whole contiguous run merged from several smaller feeds, so
