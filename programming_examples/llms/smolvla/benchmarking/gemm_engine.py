@@ -69,7 +69,7 @@ class Job:
 
 
 def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, herd_n, sym_suffix, link_with,
-                      arg_order=None):
+                      arg_order=None, stack_c=None):
     """jobs: [Job]. Args are the jobs' named tensors, in arg_order (default:
     first appearance, A, B, residual, C per job).
 
@@ -84,6 +84,11 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
     A core DMA channel cycles one BD chain, so every transfer into or out of a
     core has the same size in every job: residual tiles come in as A chunks and
     SwiGLU halves are paired into full-width output tiles.
+
+    Every output drain is armed at launch start and a shim S2MM channel queues 4
+    tasks, so more than 4 jobs with separate C tensors hang. stack_c names one
+    [len(jobs) * m, n_out] tensor that takes every job's C (job i in rows i*m..),
+    drained by one task per channel.
     """
     from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import bfp_tile_bytes
 
@@ -110,7 +115,11 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
             declare(j.residual, [m, j.n_out], bf16)
         if j.rope:
             declare(j.rope, [m, j.n], bf16)
-        declare(j.c, [m, j.n_out], bf16)
+        if not stack_c:
+            declare(j.c, [m, j.n_out], bf16)
+    if stack_c:
+        assert len({j.n_out for j in jobs}) == 1 and not any(j.swiglu for j in jobs)
+        declare(stack_c, [len(jobs) * m, jobs[0].n_out], bf16)
     arg_order = arg_order or list(shapes)
     assert sorted(arg_order) == sorted(shapes), (arg_order, list(shapes))
     T = {name: air.tensor(*shapes[name]) for name in arg_order}
@@ -183,6 +192,8 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                     for i in range(herd_m):
                                         row = li * l2_m + i * tile_m
                                         a_in.put(R[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
+                        if stack_c:
+                            continue
                         # Right after the job's own puts: a later job that reads C then waits on
                         # transfers issued before it (emitted at the end, O -> Down's residual hangs).
                         C = T[j.c]
@@ -191,6 +202,13 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                 for i in range(herd_m):
                                     row = li * l2_m + i * tile_m
                                     c_out.get(C[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
+                    if stack_c:
+                        S, n_out = T[stack_c], jobs[0].n_out
+                        for g in air.sequential(len(jobs) * m // l2_m):
+                            for lj in air.sequential(n_out // l2_n):
+                                for i in range(herd_m):
+                                    row = g * l2_m + i * tile_m
+                                    c_out.get(S[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
 
                     def l2(shape, dtype, col):
                         return air.alloc(shape, dtype, scope=seg.private(), column=col, split=False)
