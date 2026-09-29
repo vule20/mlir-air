@@ -186,4 +186,40 @@ void SYM(f32_to_bf16_rms_swiglu)(float *src, float *ss, bfloat16 *dst,
   }
 }
 
+// Attention probabilities without the running max: exp of the (scaled, masked)
+// scores, so every score must stay below ~88 (the exponent is clamped to
+// [-126, 127] in base 2: masked scores give ~1e-38, not 0).
+void SYM(f32_to_bf16_exp_mn)(float *src, bfloat16 *dst) {
+  constexpr unsigned VW = 16, N = DIM_M * DIM_N;
+  const aie::vector<float, VW> log2e = aie::broadcast<float, VW>(1.4426950409f);
+  const aie::vector<float, VW> lo = aie::broadcast<float, VW>(-126.0f);
+  const aie::vector<float, VW> hi = aie::broadcast<float, VW>(127.0f);
+  for (unsigned e = 0; e < N; e += VW) {
+    aie::vector<float, VW> x =
+        aie::mul(aie::load_v<VW>(src + e), log2e).template to_vector<float>();
+    aie::store_v(dst + e, aie::exp2<bfloat16>(aie::min(aie::max(x, lo), hi)));
+  }
+}
+
+// Softmax normalisation as a paired drain (the SwiGLU pairing): the tile_n block
+// holds tile_n/2 columns of P.V then tile_n/2 of the matching row sums P.1,
+// and the quotient fills one half of the output tile.
+void SYM(f32_to_bf16_div_mn)(float *src, bfloat16 *dst, int32_t half) {
+  constexpr unsigned VW = 16, T = 8;
+  constexpr unsigned NB = DIM_N / T, H = NB / 2, BE = DIM_M * T;
+  static_assert(NB % 2 == 0, "tile_n must hold whole value/sum block pairs");
+  ::aie::set_rounding(aie::rounding_mode::conv_even);
+  for (unsigned jb = 0; jb < H; jb++) {
+    const float *pv = src + jb * BE;
+    const float *ps = src + (jb + H) * BE;
+    bfloat16 *pd = dst + (half * H + jb) * BE;
+    for (unsigned e = 0; e < BE; e += VW) {
+      aie::vector<float, VW> q =
+          aie::mul(aie::load_v<VW>(pv + e), aie::inv(aie::load_v<VW>(ps + e)))
+              .template to_vector<float>();
+      aie::store_v(pd + e, narrow_f32_to_bf16<VW>(q));
+    }
+  }
+}
+
 } // extern "C"

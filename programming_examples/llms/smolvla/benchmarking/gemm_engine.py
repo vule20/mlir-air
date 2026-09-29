@@ -51,6 +51,10 @@ class Job:
       to pass a pair through), riding the A channel like a residual. The rotation
       acts on adjacent pairs, so head dims must be pair-interleaved in B (see
       interleave_rope_heads). Needs rms (the scale is applied first).
+    exp: drain exp(acc + R) (attention probabilities, R the additive mask).
+    div: paired like swiglu, drain value / sum (softmax normalisation of P.V).
+    a_off, c_off: column offsets of A's and C's window in their tensors (arena
+      only, multiples of the arena tile width).
     """
 
     a: str
@@ -62,14 +66,89 @@ class Job:
     rms: bool = False
     swiglu: bool = False
     rope: str = None
+    exp: bool = False
+    div: bool = False
+    a_off: int = 0
+    c_off: int = 0
 
     @property
     def n_out(self):
-        return self.n // 2 if self.swiglu else self.n
+        return self.n // 2 if self.swiglu or self.div else self.n
+
+    @property
+    def paired(self):
+        return self.swiglu or self.div
+
+
+@dataclass
+class ArenaLayout:
+    """Tile-major activation arena: arena[i, t] is one [tile_m, l2_n] tile of
+    herd row i. Tensor X [m, w] has its (li, lj) tile (rows li*l2_m + i*tile_m..,
+    cols lj*l2_n..) at t = base[X] + li * (w // l2_n) + lj. Tensors no job writes
+    come first, then every job's C in job order, so the produced tiles are the
+    contiguous run [drain_lo, n_tiles) in production order."""
+
+    base: dict
+    width: dict
+    drain_lo: int
+    n_tiles: int
+    m: int
+    tile_m: int
+    herd_m: int
+    l2_n: int
+
+    def pack(self, arena, name, x):
+        l2_m, cols = self.tile_m * self.herd_m, self.width[name] // self.l2_n
+        x = np.asarray(x).reshape(self.m // l2_m, self.herd_m, self.tile_m, cols, self.l2_n)
+        n = x.shape[0] * cols
+        arena[:, self.base[name]:self.base[name] + n] = x.transpose(1, 0, 3, 2, 4).reshape(
+            self.herd_m, n, self.tile_m, self.l2_n)
+
+    def unpack(self, arena, name):
+        l2_m, cols = self.tile_m * self.herd_m, self.width[name] // self.l2_n
+        n = self.m // l2_m * cols
+        x = np.asarray(arena)[:, self.base[name]:self.base[name] + n]
+        x = x.reshape(self.herd_m, self.m // l2_m, cols, self.tile_m, self.l2_n)
+        return x.transpose(1, 0, 3, 2, 4).reshape(self.m, self.width[name])
+
+    def empty(self):
+        return np.zeros((self.herd_m, self.n_tiles, self.tile_m, self.l2_n), bfloat16)
+
+
+def arena_layout(m, jobs, tile_m, herd_m, l2_n):
+    """Several jobs may write column windows (c_off) of one C, in column order."""
+    width, produced = {}, list(dict.fromkeys(j.c for j in jobs))
+    for j in jobs:
+        for name, lo, w in ((j.a, j.a_off, j.k), (j.residual, 0, j.n_out), (j.rope, 0, j.n),
+                            (j.c, j.c_off, j.n_out)):
+            if name:
+                assert lo % l2_n == 0 and w % l2_n == 0, name
+                width[name] = max(width.get(name, 0), lo + w)
+    base, t, rows = {}, 0, m // (tile_m * herd_m)
+    for name in [n for n in width if n not in produced] + produced:
+        base[name] = t
+        t += rows * (width[name] // l2_n)
+    drain_lo = base[produced[0]]
+    seq = [base[j.c] + li * (width[j.c] // l2_n) + j.c_off // l2_n + lj
+           for j in jobs for li in range(rows) for lj in range(j.n_out // l2_n)]
+    assert seq == list(range(drain_lo, t)), "outputs must fill the arena tail in production order"
+    return ArenaLayout(base, width, drain_lo, t, m, tile_m, herd_m, l2_n)
+
+
+def weights_layout(jobs, tile_n, tile_k_l2):
+    """Row offsets of every job's B in one weights tensor [rows, tile_k_l2 / tile_k_l1,
+    tile_bytes]: a row is one L2 B step, so B (packed [n / tile_n, k / tile_k_l1, bytes])
+    is rows base .. base + n / tile_n * k / tile_k_l2 in its own order."""
+    base, rows = {}, 0
+    for j in jobs:
+        if j.b not in base:
+            base[j.b] = rows
+            rows += j.n // tile_n * (j.k // tile_k_l2)
+    return base, rows
 
 
 def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, herd_n, sym_suffix, link_with,
-                      arg_order=None, stack_c=None):
+                      arg_order=None, stack_c=None, arena=None, weights=None, shim_at_launch=False):
     """jobs: [Job]. Args are the jobs' named tensors, in arg_order (default:
     first appearance, A, B, residual, C per job).
 
@@ -89,6 +168,11 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
     tasks, so more than 4 jobs with separate C tensors hang. stack_c names one
     [len(jobs) * m, n_out] tensor that takes every job's C (job i in rows i*m..),
     drained by one task per channel.
+
+    arena names one tensor [herd_m, n_tiles, tile_m, l2_n] replacing every A,
+    residual, RoPE and C tensor (see ArenaLayout): every activation transfer is
+    whole tiles and all jobs' outputs, of any width, drain as one task per
+    channel. B tensors stay separate.
     """
     from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import bfp_tile_bytes
 
@@ -108,15 +192,28 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
         assert j.n % l2_n == 0 and j.k % tk2 == 0
         assert not (j.residual or j.rope) or tk2 == l2_n, "a residual tile is one tile_k_l2 step"
         assert not (j.residual and j.rope) and (not j.rope or (j.rms and not j.swiglu))
-        assert not j.swiglu or (j.n // l2_n) % 2 == 0
+        assert not j.paired or (j.n // l2_n) % 2 == 0
+        assert not (j.swiglu and j.div) and not (j.div and j.rms) and not (j.exp and (j.paired or j.rope or j.rms))
+        assert not j.exp or j.residual, "exp's mask rides the residual path"
+        assert arena or not (j.a_off or j.c_off)
+        if not weights:
+            declare(j.b, [j.n // tile_n, j.k // tile_k_l1, tile_bytes], i8)
+        if arena:
+            continue
         declare(j.a, [m, j.k], bf16)
-        declare(j.b, [j.n // tile_n, j.k // tile_k_l1, tile_bytes], i8)
         if j.residual:
             declare(j.residual, [m, j.n_out], bf16)
         if j.rope:
             declare(j.rope, [m, j.n], bf16)
         if not stack_c:
             declare(j.c, [m, j.n_out], bf16)
+    if arena:
+        assert not stack_c and tk2 == l2_n, "arena tiles are one tile_k_l2 step wide"
+        lay = arena_layout(m, jobs, tile_m, herd_m, l2_n)
+        declare(arena, [herd_m, lay.n_tiles, tile_m, l2_n], bf16)
+    if weights:
+        wbase, wrows = weights_layout(jobs, tile_n, tk2)
+        declare(weights, [wrows, k_per_l2, tile_bytes], i8)
     if stack_c:
         assert len({j.n_out for j in jobs}) == 1 and not any(j.swiglu for j in jobs)
         declare(stack_c, [len(jobs) * m, jobs[0].n_out], bf16)
@@ -127,7 +224,7 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
     n_tiles = [(m // l2_m) * (j.n // l2_n) for j in jobs]
     a_steps = sum(nt * (j.k // tk2 + bool(j.residual or j.rope)) for nt, j in zip(n_tiles, jobs))
     b_steps = sum(nt * (j.k // tk2) for nt, j in zip(n_tiles, jobs))
-    c_tiles = sum(nt // (2 if j.swiglu else 1) for nt, j in zip(n_tiles, jobs))
+    c_tiles = sum(nt // (2 if j.paired else 1) for nt, j in zip(n_tiles, jobs))
 
     def ext(name, **kw):
         return air.extern(f"{name}{sym_suffix}", link_with=link_with, **kw)
@@ -147,6 +244,10 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
         swiglu_fn = ext("f32_to_bf16_rms_swiglu" if all(j.rms for j in jobs if j.swiglu) else "f32_to_bf16_swiglu_mn",
                         scalars=[i32])
         assert all(j.rms == jobs[[x.swiglu for x in jobs].index(True)].rms for j in jobs if j.swiglu)
+    if any(j.exp for j in jobs):
+        exp_fn = ext("f32_to_bf16_exp_mn")
+    if any(j.div for j in jobs):
+        div_fn = ext("f32_to_bf16_div_mn", scalars=[i32])
     assert all(not j.rms or j.swiglu or j.rope for j in jobs), "rms is only in the SwiGLU and RoPE drains"
 
     a_in = air.channel("EngAIn", size=[herd_m])
@@ -158,57 +259,114 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
 
     with air.launch(name="gemm_engine") as launch:
 
+        def act(name, li, i, col):
+            """Herd row i's tile (li, col) of activation `name`."""
+            if arena:
+                at = lay.base[name] + li * (lay.width[name] // l2_n) + col
+                return T[arena][i, at : at + 1, :, :]
+            row = li * l2_m + i * tile_m
+            return T[name][row : row + tile_m, col * l2_n : col * l2_n + l2_n]
+
+        drain_before = {}
+        if arena:
+            # Jobs read their inputs back from the host memory the drains write, so each
+            # drain group is issued before its jobs' inputs, and air-to-std awaits it
+            # before the next group's inputs. A group ends before a job reading its outputs.
+            start, group, produced_in = lay.drain_lo, 0, set()
+            rows = m // l2_m
+            for idx, j in enumerate(jobs):
+                if not idx or {j.a, j.residual} & produced_in:
+                    group, produced_in = idx, set()
+                    drain_before[group] = [start, start]
+                produced_in.add(j.c)
+                start += rows * (j.n_out // l2_n)
+                drain_before[group][1] = start
+
+        def shim_side():
+            for idx, j in enumerate(jobs):
+                if idx in drain_before:
+                    lo, hi = drain_before[idx]
+                    for i in range(herd_m):
+                        c_out.get(T[arena][i, lo:hi, :, :], indices=[i])
+                B = None if weights else T[j.b]
+                # air-isolate-async-dma-loop-nests gives every put its own loop nest,
+                # which would send all of a job's A steps before any residual step.
+                # Unrolled tile loops keep each tile's residual put right after its K steps.
+                tile_loop = range if j.residual or j.rope else air.sequential
+                for li in tile_loop(m // l2_m):
+                    for lj in tile_loop(j.n // l2_n):
+                        for k2 in air.sequential(j.k // tk2):
+                            for i in range(herd_m):
+                                if arena:
+                                    a_in.put(act(j.a, li, i, j.a_off // l2_n + k2), indices=[i])
+                                    continue
+                                row = li * l2_m + i * tile_m
+                                a_in.put(T[j.a][row : row + tile_m, k2 * tk2 : k2 * tk2 + tk2], indices=[i])
+                        # The shim command stream zips the channels' task lists, and a BD-reuse
+                        # await on a later job's task before this job's last A task deadlocks.
+                        # A residual tile is two A tasks (K steps, residual), so B is two too.
+                        k_steps = j.k // tk2
+                        halves = ([(0, k_steps // 2), (k_steps // 2, k_steps)] if j.residual or j.rope
+                                  else [(0, k_steps)])
+                        if k_steps == 1 and (j.residual or j.rope):
+                            # One K step: its two L1 chunks as the two B tasks (the memtile's
+                            # single S2MM receive only counts bytes).
+                            assert weights and k_per_l2 == 2
+                            for kk in range(k_per_l2):
+                                for c in range(herd_n):
+                                    wr = wbase[j.b] + lj * herd_n + c
+                                    b_in.put(T[weights][wr : wr + 1, kk : kk + 1, :], indices=[c])
+                            halves = []
+                        for lo, hi in [h for h in halves if h[0] < h[1]]:
+                            for k2 in air.sequential(lo, hi):
+                                for c in range(herd_n):
+                                    kc = k2 * k_per_l2
+                                    if weights:
+                                        wr = wbase[j.b] + (lj * herd_n + c) * (j.k // tk2) + k2
+                                        b_in.put(T[weights][wr : wr + 1, :, :], indices=[c])
+                                    else:
+                                        b_in.put(B[lj * herd_n + c, kc : kc + k_per_l2, :], indices=[c])
+                        if j.residual or j.rope:
+                            for i in range(herd_m):
+                                a_in.put(act(j.residual or j.rope, li, i, lj), indices=[i])
+                if stack_c or arena:
+                    continue
+                # Right after the job's own puts: a later job that reads C then waits on
+                # transfers issued before it (emitted at the end, O -> Down's residual hangs).
+                C = T[j.c]
+                for li in air.sequential(m // l2_m):
+                    for lj in air.sequential(j.n_out // l2_n):
+                        for i in range(herd_m):
+                            row = li * l2_m + i * tile_m
+                            c_out.get(C[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
+            if stack_c:
+                S, n_out = T[stack_c], jobs[0].n_out
+                for g in air.sequential(len(jobs) * m // l2_m):
+                    for lj in air.sequential(n_out // l2_n):
+                        for i in range(herd_m):
+                            row = g * l2_m + i * tile_m
+                            c_out.get(S[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
+
         @launch.body
         def _():
+            if shim_at_launch:
+                # Written in the launch: in the segment, air-dma-to-channel hoists each shim
+                # put out on its own, one greedy rewrite of the whole module per put
+                # (compile time quadratic in the job count). The launch region opens lazily
+                # at its first use, so open it first: the puts' loops must live inside it.
+                from air.api._trace import in_launch_body
+
+                in_launch_body(lambda: (shim_side(), segment()))
+            else:
+                segment()
+
+        def segment():
             with air.segment(name="engine_seg") as seg:
 
                 @seg.body
                 def _():
-                    for j in jobs:
-                        A, B = T[j.a], T[j.b]
-                        # air-isolate-async-dma-loop-nests gives every put its own loop nest,
-                        # which would send all of a job's A steps before any residual step.
-                        # Unrolled tile loops keep each tile's residual put right after its K steps.
-                        tile_loop = range if j.residual or j.rope else air.sequential
-                        for li in tile_loop(m // l2_m):
-                            for lj in tile_loop(j.n // l2_n):
-                                for k2 in air.sequential(j.k // tk2):
-                                    for i in range(herd_m):
-                                        row = li * l2_m + i * tile_m
-                                        a_in.put(A[row : row + tile_m, k2 * tk2 : k2 * tk2 + tk2], indices=[i])
-                                # The shim command stream zips the channels' task lists, and a BD-reuse
-                                # await on a later job's task before this job's last A task deadlocks.
-                                # A residual tile is two A tasks (K steps, residual), so B is two too.
-                                k_steps = j.k // tk2
-                                halves = ([(0, k_steps // 2), (k_steps // 2, k_steps)] if j.residual or j.rope
-                                          else [(0, k_steps)])
-                                for lo, hi in halves:
-                                    for k2 in air.sequential(lo, hi):
-                                        for c in range(herd_n):
-                                            kc = k2 * k_per_l2
-                                            b_in.put(B[lj * herd_n + c, kc : kc + k_per_l2, :], indices=[c])
-                                if j.residual or j.rope:
-                                    R = T[j.residual or j.rope]
-                                    for i in range(herd_m):
-                                        row = li * l2_m + i * tile_m
-                                        a_in.put(R[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
-                        if stack_c:
-                            continue
-                        # Right after the job's own puts: a later job that reads C then waits on
-                        # transfers issued before it (emitted at the end, O -> Down's residual hangs).
-                        C = T[j.c]
-                        for li in air.sequential(m // l2_m):
-                            for lj in air.sequential(j.n_out // l2_n):
-                                for i in range(herd_m):
-                                    row = li * l2_m + i * tile_m
-                                    c_out.get(C[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
-                    if stack_c:
-                        S, n_out = T[stack_c], jobs[0].n_out
-                        for g in air.sequential(len(jobs) * m // l2_m):
-                            for lj in air.sequential(n_out // l2_n):
-                                for i in range(herd_m):
-                                    row = g * l2_m + i * tile_m
-                                    c_out.get(S[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
+                    if not shim_at_launch:
+                        shim_side()
 
                     def l2(shape, dtype, col):
                         return air.alloc(shape, dtype, scope=seg.private(), column=col, split=False)
@@ -232,6 +390,36 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                             b_in.get(l2_b[c], indices=[c])
                             for kk in range(k_per_l2):
                                 b2l1.put(l2_b[c][kk, :], indices=[0, c])
+
+                    def run_job(j, nt, tile, emit):
+                        if j.swiglu and j.rms:
+                            # The row statistics depend on the row block only: gathered on its
+                            # first tile's K pass, reused by the rest (tiles are li-major).
+                            pairs = j.n // l2_n // 2
+                            for _ in air.sequential(m // l2_m):
+                                tile(j, 0, stats=True)
+                                tile(j, 1)
+                                emit()
+                                for _ in air.sequential(pairs - 1):
+                                    tile(j, 0)
+                                    tile(j, 1)
+                                    emit()
+                        elif j.rms:
+                            for _ in air.sequential(m // l2_m):
+                                tile(j, stats=True)
+                                emit()
+                                for _ in air.sequential(j.n // l2_n - 1):
+                                    tile(j)
+                                    emit()
+                        elif j.paired:
+                            for _ in air.sequential(nt // 2):
+                                tile(j, 0)
+                                tile(j, 1)
+                                emit()
+                        else:
+                            for _ in air.sequential(nt):
+                                tile(j)
+                                emit()
 
                     with air.herd([range(herd_m), range(herd_n)], name="herd_0",
                                   shape=(herd_m, herd_n)) as h:
@@ -272,38 +460,31 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                         swiglu_fn(acc, ss, drain, half)
                                     else:
                                         swiglu_fn(acc, drain, half)
+                                elif j.div:
+                                    div_fn(acc, drain, half)
+                                elif j.exp:
+                                    exp_fn(acc, drain)
                                 else:
                                     drain_fn(acc, drain)
 
-                            for j, nt in zip(jobs, n_tiles):
-                                if j.swiglu and j.rms:
-                                    # The row statistics depend on the row block only: gathered on its
-                                    # first tile's K pass, reused by the rest (tiles are li-major).
-                                    pairs = j.n // l2_n // 2
-                                    for _ in air.sequential(m // l2_m):
-                                        tile(j, 0, stats=True)
-                                        tile(j, 1)
-                                        c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
-                                        for _ in air.sequential(pairs - 1):
-                                            tile(j, 0)
-                                            tile(j, 1)
-                                            c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
-                                elif j.rms:
-                                    for _ in air.sequential(m // l2_m):
-                                        tile(j, stats=True)
-                                        c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
-                                        for _ in air.sequential(j.n // l2_n - 1):
-                                            tile(j)
-                                            c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
-                                elif j.swiglu:
-                                    for _ in air.sequential(nt // 2):
-                                        tile(j, 0)
-                                        tile(j, 1)
-                                        c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
+                            # Cores see only shapes and epilogues: a job list repeating with period p
+                            # (e.g. per layer) runs one period in a loop, as core program memory is 16 KB.
+                            sig = [(j.k, j.n, bool(j.residual), j.rms, j.swiglu, bool(j.rope), j.exp, j.div)
+                                   for j in jobs]
+                            period = next(p for p in range(1, len(jobs) + 1)
+                                          if len(jobs) % p == 0 and sig == sig[:p] * (len(jobs) // p))
+                            runs = []  # consecutive identical jobs of one period, run as one loop
+                            for p in range(period):
+                                if runs and sig[runs[-1][0]] == sig[p]:
+                                    runs[-1][1] += 1
                                 else:
-                                    for _ in air.sequential(nt):
-                                        tile(j)
-                                        c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
+                                    runs.append([p, 1])
+                            for _ in air.sequential(len(jobs) // period):
+                                for p, count in runs:
+                                    for _ in air.sequential(count):
+                                        run_job(jobs[p], n_tiles[p], tile,
+                                                lambda: c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5),
+                                                                 indices=[tx, ty]))
 
                     for i in range(herd_m):
                         for _ in air.sequential(c_tiles):
@@ -363,7 +544,13 @@ def compile_mm_engine(tile_m, tile_n, tile_k_l1, sym_suffix, out_name, rms_k=960
         f"-DDIM_M={tile_m}", f"-DDIM_N={tile_n}", f"-DDIM_K={tile_k_l1}",
         f"-DSYM_SUFFIX={sym_suffix}", f"-DRMS_K={rms_k}", "-Wno-macro-redefined",
     ]
-    _compile_kernel(_HERE / "kernels_bfp16" / "mm_engine.cc", out_name, extra_flags=extra, force=True)
+    # Rebuilt only when stale: the kernel cache keys ELFs on the object's mtime, so an
+    # unconditional rebuild recompiles every cached engine (tens of minutes for many jobs).
+    # An out_name must keep one set of flags.
+    srcs = [_HERE / "kernels_bfp16" / n for n in ("mm_engine.cc", "mm_bfp16.cc")]
+    obj = Path(out_name)
+    stale = not obj.exists() or max(s.stat().st_mtime for s in srcs) > obj.stat().st_mtime
+    _compile_kernel(srcs[0], out_name, extra_flags=extra, force=stale)
 
 
 def build_gemm_engine_loads(m, jobs, tile_m, tile_n, tile_k_l1, herd_m, herd_n, sym_suffix, link_with):
