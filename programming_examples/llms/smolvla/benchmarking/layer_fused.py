@@ -41,6 +41,13 @@ _RGR_MAP = {i: i for i in range(9)}
 _FA_MAP = {0: 6, 1: 8, 2: 4, 3: 9, 4: 10}
 _OFFN_MAP = {0: 10, 1: 11, 2: 12, 3: 0, 4: 13, 5: 14, 6: 15, 7: 16, 9: 17, 10: 18, 11: 19, 12: 20}
 
+# gemm_engine O+FFN (one launch; operands attn, wo, x, res1, wgu, sw, wdn, out). proj,
+# normed2 and down (12, 15, 19) are never materialised and ffn_norm (14) is folded into
+# w_gateup, which is permuted (gemm_engine.permute_gate_up); out is 2-D.
+OFFN_ENGINE_ORDER = ["attn", "wo", "x", "res1", "wgu", "sw", "wdn", "out"]
+_OFFN_ENGINE_MAP = {0: 10, 1: 11, 2: 0, 3: 13, 4: 16, 5: 17, 6: 18, 7: 20}
+_OFFN_ENGINE_UNUSED = {12, 14, 15, 19}
+
 LAYER_STATIC = {1, 3, 5, 7, 9, 11, 14, 16, 18}
 LAYER_INTERMEDIATE = {2, 4, 6, 8, 10, 12, 13, 15, 17, 19, 20}
 LAYER_OUT = 20
@@ -55,23 +62,29 @@ def _privates(ir):
     return set(re.findall(r"func\.func private (@\w+)", ir))
 
 
-def build_layer_module(rgr_ir, fa_ir, offn_ir, tilings):
+def build_layer_module(rgr_ir, fa_ir, offn_ir, tilings, offn_engine=False):
     """rgr_ir / fa_ir / offn_ir: sub-module texts (FA built with attn_mask=True
     and v_cols = the qkv width). tilings: {"rgr", "fa", "offn"} -> the shim-DMA
-    tile sizes each sub-module's launches were tuned with."""
+    tile sizes each sub-module's launches were tuned with. offn_engine: offn_ir
+    is the one-launch gemm_engine O+FFN."""
+    offn_map = _OFFN_ENGINE_MAP if offn_engine else _OFFN_MAP
     types = [None] * 21
-    for ir, amap in ((rgr_ir, _RGR_MAP), (fa_ir, _FA_MAP), (offn_ir, _OFFN_MAP)):
+    for ir, amap in ((rgr_ir, _RGR_MAP), (fa_ir, _FA_MAP), (offn_ir, offn_map)):
         for op_idx, t in enumerate(_signature_types(ir)):
             if op_idx in amap:
                 c = amap[op_idx]
                 assert types[c] in (None, t), f"arg{c}: {types[c]} vs {t}"
                 types[c] = t
+    unused = _OFFN_ENGINE_UNUSED if offn_engine else set()
+    for c in unused:
+        types[c] = types[1] if c == 14 else types[0]
     assert None not in types, types
     base_args = [FuncArg(f"%arg{i}", t) for i, t in enumerate(types)]
 
-    parts = (("rg", rgr_ir, _RGR_MAP, "rgr"), ("at", fa_ir, _FA_MAP, "fa"), ("of", offn_ir, _OFFN_MAP, "offn"))
+    parts = (("rg", rgr_ir, _RGR_MAP, "rgr"), ("at", fa_ir, _FA_MAP, "fa"), ("of", offn_ir, offn_map, "offn"))
     slices = [KernelSlice(ir, p, amap, extern_syms=_privates(ir)) for p, ir, amap, _ in parts]
-    module = stitch_elf("layer", base_args, slices, debug_dump_path="/tmp/layer_fused_parse_error.mlir")
+    module = stitch_elf("layer", base_args, slices, debug_dump_path="/tmp/layer_fused_parse_error.mlir",
+                        allow_unreferenced_args=unused)
 
     from air.ir import DenseI64ArrayAttr
 
@@ -84,7 +97,8 @@ def build_layer_module(rgr_ir, fa_ir, offn_ir, tilings):
     assert len(launches) == len(per_launch), (len(launches), len(per_launch))
     with module.context:
         for op, ts in zip(launches, per_launch):
-            op.attributes["air.shim_dma_tile_sizes"] = DenseI64ArrayAttr.get(ts)
+            if ts:
+                op.attributes["air.shim_dma_tile_sizes"] = DenseI64ArrayAttr.get(ts)
     print(f"  Layer module: {len(launches)} launches, {len(str(module).splitlines())} lines, parsed OK")
     return module
 

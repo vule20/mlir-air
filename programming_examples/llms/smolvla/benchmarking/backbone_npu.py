@@ -158,6 +158,28 @@ _BFP16 = {}
 _BFP16_TILES = {"qkv": (80, 480, 160), "o": (80, 480, 160), "gu": (128, 480, 160, 8), "dn": (80, 256, 128)}
 
 
+# gemm_engine O+FFN tiles (--offn-engine): one tile_n / tile_k_l1 for O, GateUp and Down.
+_ENGINE = {"on": False, "tile_n": 80, "tile_k_l1": 160, "herd": 4}
+
+
+def _engine_offn_weights(lw, emb, hidden):
+    """wo, w_gateup (ffn_norm folded in, SwiGLU-permuted) and w_down packed for the engine."""
+    from gemm_engine import permute_gate_up
+    from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import pack_b_bfp16ebs8
+
+    tn, tk1 = _ENGINE["tile_n"], _ENGINE["tile_k_l1"]
+    f32 = np.float32
+    nw = np.asarray(lw.ffn_norm, dtype=bfloat16).astype(f32).reshape(emb, 1)
+    wg = (nw * np.asarray(lw.w_gate, dtype=bfloat16).astype(f32)).astype(bfloat16)
+    wu = (nw * np.asarray(lw.w_up, dtype=bfloat16).astype(f32)).astype(bfloat16)
+
+    def pack(w):
+        return pack_b_bfp16ebs8(np.ascontiguousarray(np.asarray(w, dtype=bfloat16)), tn, tk1)
+
+    return (pack(np.asarray(lw.wo).reshape(emb, emb)), pack(permute_gate_up(wg, wu, tn, tn * _ENGINE["herd"])),
+            pack(np.asarray(lw.w_down).reshape(hidden, emb)))
+
+
 def _weight(key, w):
     """bf16 [K, N] weight -> what the GEMM `key` consumes (packed bfp16ebs8 if enabled)."""
     w = np.ascontiguousarray(np.asarray(w, dtype=bfloat16))
@@ -260,7 +282,7 @@ def compile_backbone_kernels(
     fused_qkv=False, qkv_tile_n=80, gu_bstationary=False, qkv_bstationary=False,
     od_bstationary=False, od_tile_n=80, o_bstationary=None, dn_bstationary=None, dn_herd_m=None,
     dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False, npu_attn=False, fused_layer=False, fa_opt="-O2", layers_per_call=1,
-    fa_his=1, fa_qb=False,
+    fa_his=1, fa_qb=False, offn_engine=False,
 ):
     """Replacement for llama32_1b_prefill.compile_all_kernels: that function
     hardcodes mm.o pre-compiles at tile_n=128 (llama32_1b's own registry
@@ -357,13 +379,28 @@ def compile_backbone_kernels(
                               q_bcast=fa_qb)
         cache.compile_and_cache("flash_attn", fa_mod, {**_FA_BACKEND, "verbose": cache.verbose})
     if fused_layer:
-        from layer_fused import build_layer_module
+        from layer_fused import OFFN_ENGINE_ORDER, build_layer_module
 
+        offn_tiling = _TILING["offn"]
+        if offn_engine:
+            from gemm_engine import Job, build_gemm_engine, compile_mm_engine
+
+            E, H = config.emb_dim, config.hidden_dim
+            tn, tk1, herd = _ENGINE["tile_n"], _ENGINE["tile_k_l1"], _ENGINE["herd"]
+            compile_mm_engine(32, tn, tk1, "_eng", "mm_engine.o", rms_k=E)
+            offn_mod = build_gemm_engine(
+                seq_len,
+                [Job("attn", "wo", "res1", E, E, residual="x"),
+                 Job("res1", "wgu", "sw", E, 2 * H, rms=True, swiglu=True),
+                 Job("sw", "wdn", "out", H, E, residual="res1")],
+                32, tn, tk1, tn * herd, herd, herd, "_eng", "mm_engine.o", arg_order=OFFN_ENGINE_ORDER,
+            )
+            offn_tiling = []
         cache.compile_and_cache(
             "layer",
             build_layer_module(str(rgr_mod), str(fa_mod), str(offn_mod),
                                {"rgr": _TILING["rgr"], "fa": _FA_BACKEND["runtime_loop_tiling_sizes"],
-                                "offn": _TILING["offn"]}),
+                                "offn": offn_tiling}, offn_engine=offn_engine),
             {**_LAYER_BACKEND, "verbose": cache.verbose},
         )
         if layers_per_call > 1:
@@ -588,7 +625,7 @@ def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_i
         def z(*shape):
             return np.zeros(shape, dtype=bfloat16)
 
-        _arg_cache[key] = [
+        args = [
             None,
             np.asarray(lw.attn_norm, dtype=bfloat16).reshape(emb), z(seq_len, emb),
             w_qkv, z(seq_len, emb + 2 * kv),
@@ -601,6 +638,10 @@ def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_i
             _weight("dn", np.asarray(lw.w_down).reshape(hidden, emb)), z(seq_len, emb),
             z(seq_len * emb),
         ]
+        if _ENGINE["on"]:
+            args[11], args[16], args[18] = _engine_offn_weights(lw, emb, hidden)
+            args[20] = z(seq_len, emb)
+        _arg_cache[key] = args
     args = _arg_cache[key]
     args[0] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb)
     results = cache.load_and_run(
@@ -707,6 +748,8 @@ def main():
     ap.add_argument("--fa-his", type=int, default=1,
                     help="FA heads_in_segment: heads looped inside the segment per launch iteration")
     ap.add_argument("--fa-qb", action="store_true", help="FA q_bcast: Q on its own per-column channel")
+    ap.add_argument("--offn-engine", action="store_true",
+                    help="with --fused-layer: O+FFN as one gemm_engine launch instead of six")
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--save-out", default="", help="np.save every layer's NPU output (float32) here")
     ap.add_argument("--dup", default="", help="timing probe: comma list of o_ffn slice prefixes to run twice "
@@ -744,6 +787,10 @@ def main():
         bfp_tag += f"_his{args.fa_his}"
     if args.fa_qb:
         bfp_tag += "_qb"
+    assert not args.offn_engine or (args.fused_layer and lpc == 1), "--offn-engine needs --fused-layer, 1 layer/call"
+    _ENGINE["on"] = args.offn_engine
+    if args.offn_engine:
+        bfp_tag += "_offneng"
     sw_tag = "sw" if args.gu_swiglu else ""
     gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{sw_tag}{od_tag}{dup_tag}" if args.fused_gu else ""
     qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
@@ -767,6 +814,7 @@ def main():
         dn_tile_m=args.dn_tile_m, dn_tile_n=args.dn_tile_n, offn_dup=offn_dup, gu_swiglu=args.gu_swiglu,
         npu_attn=args.npu_attn, fused_layer=args.fused_layer, fa_opt=args.fa_opt,
         layers_per_call=args.layers_per_call, fa_his=args.fa_his, fa_qb=args.fa_qb,
+        offn_engine=args.offn_engine,
     )
     for name, override in (("o_ffn", args.offn_elf), ("rms_gemms_rope", args.rgr_elf)):
         if override:
