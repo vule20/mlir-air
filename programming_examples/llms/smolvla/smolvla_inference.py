@@ -76,6 +76,11 @@ if os.environ.get("SMOLVLA_CPU_BIND", "1") == "1" and "torch" not in sys.modules
 #                       comparison arm stays unmodified.
 EXPERT_KV_MEMO = os.environ.get("SMOLVLA_EXPERT_KV_MEMO", "1") == "1"
 
+#   SMOLVLA_NPU_BACKBONE (default 0) EXPERIMENTAL: run the backbone's prefix fill
+#                       on the NPU too (benchmarking/backbone_runtime.py), the
+#                       default for run_hybrid_forward's npu_backbone.
+NPU_BACKBONE = os.environ.get("SMOLVLA_NPU_BACKBONE", "0") == "1"
+
 DEFAULT_MODEL = "lerobot/smolvla_base"
 DEFAULT_PROMPT = "pick up the cube"
 
@@ -100,7 +105,9 @@ def build_config(npu_vision: bool = True) -> dict:
         "model": DEFAULT_MODEL,
         "prompt": DEFAULT_PROMPT,
         "execution_model": "single-process (air/pyxrt in the lerobot venv)",
-        "npu_stages": "vision" if npu_vision else "none (pure CPU)",
+        "npu_stages": ("vision + backbone (experimental)" if NPU_BACKBONE else "vision")
+        if npu_vision
+        else "none (pure CPU)",
     }
 
 
@@ -213,6 +220,22 @@ def fixed_noise(policy):
     )
 
 
+_BACKBONE_RT: dict = {}
+
+
+def get_backbone_runtime(policy, profile=False):
+    """The NPU backbone runtime for `policy`, built once per process."""
+    rt = _BACKBONE_RT.get(id(policy))
+    if rt is None:
+        bench = str(_HERE / "benchmarking")
+        if bench not in sys.path:
+            sys.path.insert(0, bench)
+        from backbone_runtime import BackboneRuntime
+
+        rt = _BACKBONE_RT[id(policy)] = BackboneRuntime(policy, profile=profile)
+    return rt
+
+
 def warmup_npu():
     """Build the vision runtime and run one throwaway encode.
 
@@ -231,6 +254,7 @@ def run_hybrid_forward(
     noise=None,
     npu_vision: bool = True,
     timings: dict | None = None,
+    npu_backbone: bool | None = None,
 ):
     """Run one `predict_action_chunk`; return the (1, chunk, action_dim) chunk.
 
@@ -238,6 +262,9 @@ def run_hybrid_forward(
         instead of lerobot's CPU vision tower. False runs the model completely
         unmodified, which is the baseline the gate compares against.
     timings    : optional dict, filled with the NPU stage's phase timings.
+    npu_backbone : also run the backbone's prefix fill on the NPU (experimental;
+        default SMOLVLA_NPU_BACKBONE, never for the pure-CPU arm). Only the fill call is swapped: the expert's
+        ten calls, which read the fill's KV cache, stay lerobot's CPU code.
     """
     import torch
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -245,10 +272,26 @@ def run_hybrid_forward(
     if policy is None:
         policy = SmolVLAPolicy.from_pretrained(DEFAULT_MODEL).eval()
 
+    if npu_backbone is None:
+        npu_backbone = NPU_BACKBONE and npu_vision
     vwe = policy.model.vlm_with_expert
     orig_embed_prefix = policy.model.embed_prefix
     orig_embed_image = vwe.embed_image
+    orig_forward = vwe.forward
     ref_dtype = next(policy.parameters()).dtype
+
+    def _npu_fill_forward(*a, **kw):
+        # sample_actions keeps only the KV cache from the fill (`_, past_key_values
+        # = ...`), so the hidden-state output is returned as None.
+        embs = kw.get("inputs_embeds")
+        if a or kw.get("past_key_values") is not None or embs is None or embs[1] is not None:
+            return orig_forward(*a, **kw)
+        assert kw.get("use_cache", True), "the NPU fill only produces the KV cache"
+        t = time.perf_counter()
+        cache = get_backbone_runtime(policy).fill(embs[0], kw["attention_mask"], kw["position_ids"])
+        if timings is not None:
+            timings["backbone_npu_ms"] = (time.perf_counter() - t) * 1e3
+        return [None, None], cache
 
     def _wrapped_embed_prefix(*a, **kw):
         # Two swaps, not one, and the outer one is load-bearing for SPEED, not
@@ -310,6 +353,8 @@ def run_hybrid_forward(
         policy.model.embed_prefix = _wrapped_embed_prefix
         if CPU_THREADS > 0:
             torch.set_num_threads(CPU_THREADS)
+    if npu_backbone:
+        vwe.forward = _npu_fill_forward
     try:
         policy.reset()
         with torch.no_grad():
@@ -317,6 +362,7 @@ def run_hybrid_forward(
     finally:
         policy.model.embed_prefix = orig_embed_prefix
         vwe.embed_image = orig_embed_image
+        vwe.forward = orig_forward
         torch.set_num_threads(prev_threads)
         for m in memos:
             m.enabled = False
@@ -414,7 +460,9 @@ def compile_only(cache_dir: str = VISION_CACHE_DIR) -> int:
     return 0
 
 
-def run_profile(prompt: str = DEFAULT_PROMPT, reps: int = 5, n_cameras: int = 3) -> int:
+def run_profile(
+    prompt: str = DEFAULT_PROMPT, reps: int = 5, n_cameras: int = 3, npu_backbone: bool = False
+) -> int:
     """Pure CPU vs NPU vision, measured so the comparison is worth reporting.
 
     Four things the naive "run one, then run the other" does wrong, and what
@@ -468,30 +516,45 @@ def run_profile(prompt: str = DEFAULT_PROMPT, reps: int = 5, n_cameras: int = 3)
 
     vwe.embed_image, vwe.forward = timed_embed_image, timed_forward
 
-    def once(npu: bool) -> tuple:
+    def once(npu: bool, npu_bb: bool = False) -> tuple:
         cur.clear()
         t: dict = {}
         t0 = time.perf_counter()
-        run_hybrid_forward(batch, policy=policy, noise=noise, npu_vision=npu, timings=t)
+        chunk = run_hybrid_forward(
+            batch, policy=policy, noise=noise, npu_vision=npu, timings=t, npu_backbone=npu_bb
+        )
         wall = (time.perf_counter() - t0) * 1e3
         vision = t["vision"]["wall_ms"] if npu else cur.get("vision", 0.0)
-        return wall, vision, cur.get("backbone", 0.0), cur.get("expert", 0.0)
+        backbone = t["backbone_npu_ms"] if npu_bb else cur.get("backbone", 0.0)
+        return wall, vision, backbone, cur.get("expert", 0.0), chunk
 
     try:
         once(False)
         once(True)  # warm both arms, discard
+        if npu_backbone:
+            once(True, True)
         rt.cache.profiler.kernel_times.clear()  # drop the warmup dispatches
 
         cpu, npu, vis, cvis, bb, ex = [], [], [], [], [], []
+        nbb = {"wall": [], "vision": [], "backbone": [], "expert": []}
+        npu_bb_cpu, npu_ex = [], []
+        chunks = {}
         for _ in range(reps):
-            w, v, b, e = once(False)
+            w, v, b, e, chunks["cpu"] = once(False)
             cpu.append(w)
             cvis.append(v)
             bb.append(b)
             ex.append(e)
-            w, v, _, _ = once(True)
+            w, v, b, e, chunks["npu"] = once(True)
             npu.append(w)
             vis.append(v)
+            npu_bb_cpu.append(b)
+            npu_ex.append(e)
+            if npu_backbone:
+                row = once(True, True)
+                chunks["npu_bb"] = row[4]
+                for k, x in zip(nbb, row[:4]):
+                    nbb[k].append(x)
     finally:
         vwe.embed_image, vwe.forward = orig_embed_image, orig_fwd
 
@@ -533,9 +596,32 @@ def run_profile(prompt: str = DEFAULT_PROMPT, reps: int = 5, n_cameras: int = 3)
         f"{'  CPU both':>10s}"
     )
 
+    if npu_backbone:
+        def cmp(name):
+            c, r = chunks[name].ravel().astype(np.float64), chunks["cpu"].ravel().astype(np.float64)
+            cos = float(c @ r / (np.linalg.norm(c) * np.linalg.norm(r)))
+            return cos, normalized_mse(chunks[name], chunks["cpu"]), float(np.abs(c - r).max())
+
+        print()
+        print("  EXPERIMENTAL: NPU vision + NPU backbone + CPU expert (third interleaved arm)")
+        print(f"  {'':{W}s} {'CPU':>9s} {'NPU vis':>9s} {'NPU v+bb':>9s}")
+        print(f"  {'-' * W} {'-' * 9} {'-' * 9} {'-' * 9}")
+        for label, a, b2, c3 in (
+            ("end to end (median)", cpu, npu, nbb["wall"]),
+            ("vision", cvis, vis, nbb["vision"]),
+            ("backbone fill", bb, npu_bb_cpu, nbb["backbone"]),
+            ("action expert (x10)", ex, npu_ex, nbb["expert"]),
+        ):
+            print(f"  {label:{W}s} {med(a):9.1f} {med(b2):9.1f} {med(c3):9.1f}")
+        print(f"\n  speedup vs CPU (median)  NPU vis {med(cpu) / med(npu):.3f}x   "
+              f"NPU vis+bb {med(cpu) / med(nbb['wall']):.3f}x")
+        for name in ("npu", "npu_bb"):
+            cos, nmse, mx = cmp(name)
+            print(f"  action chunk vs pure CPU  {name:7s} cosine {cos:.6f}  nMSE {nmse:.6f}  max|d| {mx:.4f}")
+
     kt = rt.cache.profiler.kernel_times
     if kt:
-        n_img = reps * n_cam
+        n_img = reps * n_cam * (2 if npu_backbone else 1)
         print()
         print(
             f"  {f'NPU device time, per image (of {n_cam})':{W}s} "
@@ -589,6 +675,11 @@ def main() -> int:
     )
     ap.add_argument("--reps", type=int, default=5, help="reps per arm for --profile")
     ap.add_argument(
+        "--npu-backbone",
+        action="store_true",
+        help="EXPERIMENTAL: also run the backbone fill on the NPU (a third arm under --profile)",
+    )
+    ap.add_argument(
         "--input",
         choices=("synthetic", "real"),
         default="synthetic",
@@ -605,7 +696,7 @@ def main() -> int:
         # Timing only. Pixel values do not change how much the NPU computes, so
         # --input has no meaning here; camera count does, since it is the host
         # loop count.
-        return run_profile(args.prompt, args.reps, args.cameras)
+        return run_profile(args.prompt, args.reps, args.cameras, args.npu_backbone or NPU_BACKBONE)
 
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
@@ -635,6 +726,7 @@ def main() -> int:
         noise=fixed_noise(policy),
         npu_vision=npu_vision,
         timings=timings,
+        npu_backbone=args.npu_backbone or NPU_BACKBONE,
     )
     wall_ms = (time.perf_counter() - t0) * 1e3
 

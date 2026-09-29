@@ -605,9 +605,12 @@ def run_transformer_block_custom(
         return results[_out_idx].reshape(seq_len, emb_dim)
 
 
-def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_idx=0, gu_swiglu_half=0):
+def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_idx=0, gu_swiglu_half=0,
+                    with_kv=False):
     """One backbone layer as ONE dispatch of the stitched `layer` ELF
-    (layer_fused.py): RMS+QKV+RoPE, masked FlashAttention, O+FFN."""
+    (layer_fused.py): RMS+QKV+RoPE, masked FlashAttention, O+FFN. with_kv=True also
+    returns the qkv (V in its last kv columns) and roped-K buffers; they are views
+    into shared BOs, overwritten by the next call."""
     from layer_fused import LAYER_INTERMEDIATE, LAYER_OUT, LAYER_STATIC
     from o_ffn_fused_gu import interleave_gate_up
 
@@ -645,10 +648,14 @@ def run_layer_fused(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_i
     args = _arg_cache[key]
     args[0] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb)
     results = cache.load_and_run(
-        "layer", _LAYER_BACKEND, *args, output_indices=[LAYER_OUT], static_input_indices=LAYER_STATIC,
-        intermediate_indices=LAYER_INTERMEDIATE, bo_key=key, shared_nonstatic=True,
+        "layer", _LAYER_BACKEND, *args, output_indices=[LAYER_OUT, 4, 8] if with_kv else [LAYER_OUT],
+        static_input_indices=LAYER_STATIC, intermediate_indices=LAYER_INTERMEDIATE, bo_key=key,
+        shared_nonstatic=True,
     )
-    return results[LAYER_OUT].reshape(seq_len, emb)
+    out = results[LAYER_OUT].reshape(seq_len, emb)
+    if with_kv:
+        return out, results[4].reshape(seq_len, emb + 2 * kv), results[8].reshape(seq_len, kv)
+    return out
 
 
 def run_layers_fused(x_bf16, first_layer, n_layers, all_weights, rope_lut_bf16, config, cache, gu_swiglu_half=0):
