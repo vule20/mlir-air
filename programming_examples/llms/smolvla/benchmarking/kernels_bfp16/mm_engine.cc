@@ -9,6 +9,8 @@
 //   zero_rows / sumsq_rows_blocked   per-row sum of squares of the A chunks
 //                                    (RMSNorm statistics of the GEMM input)
 //   rows_rstd              ss -> rsqrt(ss/RMS_K + eps)
+//   rms_rope_blocked       row scale by rstd, then RoPE on column pairs, with
+//                          the (cos, sin) table arriving on the A channel
 //   f32_to_bf16_rms_swiglu drain: row scale by rstd, then SwiGLU, into one half
 //                          of the output tile
 //
@@ -78,9 +80,65 @@ void SYM(sumsq_rows_blocked)(bfloat16 *a, float *ss) {
 }
 
 // Sum of squares -> rstd = rsqrt(ss / RMS_K + eps), in place.
+// Vector form: the scalar loop is fully unrolled (2.6 KB) and pulls in a soft
+// float multiply, and every core's program is reloaded on every launch.
 void SYM(rows_rstd)(float *ss) {
-  for (unsigned r = 0; r < DIM_M; r++)
-    ss[r] = aie::invsqrt(ss[r] * (1.0f / RMS_K) + RMS_EPS);
+  constexpr unsigned VW = 16;
+  static_assert(DIM_M % VW == 0, "rows in whole vectors");
+  const aie::vector<float, VW> inv_k = aie::broadcast<float, VW>(1.0f / RMS_K);
+  const aie::vector<float, VW> eps = aie::broadcast<float, VW>(RMS_EPS);
+  for (unsigned r = 0; r < DIM_M; r += VW) {
+    aie::vector<float, VW> v =
+        aie::mul(aie::load_v<VW>(ss + r), inv_k).template to_vector<float>();
+    aie::store_v(ss + r, aie::invsqrt(aie::add(v, eps)));
+  }
+}
+
+// RMSNorm row scale, then RoPE on adjacent column pairs: (a, b) -> (a cos - b sin,
+// b cos + a sin), with (cos, sin) the matching column pair of the A tile's half
+// `half` (the table rides the A channel like a residual). Head dims are stored
+// pair-interleaved so each rotation stays inside one 8x8 block; (1, 0) pairs pass
+// columns through unrotated.
+void SYM(rms_rope_blocked)(float *acc, float *ss, bfloat16 *a, int32_t half) {
+  constexpr unsigned T = 8, NB = DIM_N / T, MB = DIM_M / T, KB = DIM_K / T;
+  constexpr unsigned BE = T * T, VW = 16;
+  static_assert(DIM_K == 2 * DIM_N, "one A chunk holds two output tiles");
+  const aie::mask<VW> hi_rows = aie::mask<VW>::from_uint32(0xFF00u);
+  for (unsigned nb = 0; nb < NB; nb++) {
+    for (unsigned mb = 0; mb < MB; mb++) {
+      float *pc = acc + (nb * MB + mb) * BE;
+      const bfloat16 *pa = a + (mb * KB + half * NB + nb) * BE;
+      for (unsigned e = 0; e < BE; e += 2 * VW) {
+        // Lanes of the two vectors: rows row .. row+3, 8 columns each.
+        const unsigned row = mb * T + e / T;
+        const aie::vector<float, VW> s0 =
+            aie::select(aie::broadcast<float, VW>(ss[row]),
+                        aie::broadcast<float, VW>(ss[row + 1]), hi_rows);
+        const aie::vector<float, VW> s1 =
+            aie::select(aie::broadcast<float, VW>(ss[row + 2]),
+                        aie::broadcast<float, VW>(ss[row + 3]), hi_rows);
+        aie::vector<float, VW> x0 =
+            aie::mul(aie::load_v<VW>(pc + e), s0).template to_vector<float>();
+        aie::vector<float, VW> x1 = aie::mul(aie::load_v<VW>(pc + e + VW), s1)
+                                        .template to_vector<float>();
+        auto [xa, xb] = aie::interleave_unzip(x0, x1, 1);
+        aie::accum<accfloat, VW> t0, t1;
+        t0.from_vector(aie::load_v<VW>(pa + e));
+        t1.from_vector(aie::load_v<VW>(pa + e + VW));
+        auto [co, si] = aie::interleave_unzip(t0.template to_vector<float>(),
+                                              t1.template to_vector<float>(), 1);
+        aie::vector<float, VW> oa =
+            aie::sub(aie::mul(xa, co).template to_vector<float>(),
+                     aie::mul(xb, si).template to_vector<float>());
+        aie::vector<float, VW> ob =
+            aie::add(aie::mul(xb, co).template to_vector<float>(),
+                     aie::mul(xa, si).template to_vector<float>());
+        auto [o0, o1] = aie::interleave_zip(oa, ob, 1);
+        aie::store_v(pc + e, o0);
+        aie::store_v(pc + e + VW, o1);
+      }
+    }
+  }
 }
 
 // g and u are narrowed to bf16, scaled by the per-row rstd, then silu_and_mul's

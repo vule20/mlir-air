@@ -117,6 +117,53 @@ def multi_layer_arg(layer, layer_arg):
     return 2 + len(MULTI_SHARED) + layer * len(MULTI_PER_LAYER) + MULTI_PER_LAYER.index(layer_arg)
 
 
+# Three-launch layer: gemm_engine rms+QKV+RoPE (q/k head dims pair-interleaved,
+# gemm_engine.qkv_col_perm) -> FlashAttention reading Q|K|V out of the one wide
+# buffer (fused_qkv) -> gemm_engine O+FFN.
+ENG_LAYER_ARGS = ["x", "wqkv", "rope", "qkv", "mask", "attn", "wo", "res1", "wgu", "sw", "wdn", "out"]
+QKV_ENGINE_ORDER = ["x", "wqkv", "rope", "qkv"]
+_QKV_ENG_MAP = {0: 0, 1: 1, 2: 2, 3: 3}
+_FA_FUSED_MAP = {0: 3, 1: 4, 2: 5}
+_OFFN_ENG_MAP2 = {0: 5, 1: 6, 2: 0, 3: 7, 4: 8, 5: 9, 6: 10, 7: 11}
+ENG_LAYER_STATIC = {1, 2, 4, 6, 8, 10}
+ENG_LAYER_INTERMEDIATE = {3, 5, 7, 9, 11}
+ENG_LAYER_OUT = 11
+ENG_LAYER_QKV = 3
+
+
+def build_engine_layer_module(qkv_ir, fa_ir, offn_ir, fa_tiling):
+    """qkv_ir / offn_ir: gemm_engine modules (no shim tiling); fa_ir: FA built
+    with fused_qkv=True, attn_mask=True."""
+    parts = (("qe", qkv_ir, _QKV_ENG_MAP, []), ("at", fa_ir, _FA_FUSED_MAP, fa_tiling),
+             ("of", offn_ir, _OFFN_ENG_MAP2, []))
+    types = [None] * len(ENG_LAYER_ARGS)
+    for _, ir, amap, _ in parts:
+        for op_idx, t in enumerate(_signature_types(ir)):
+            c = amap[op_idx]
+            assert types[c] in (None, t), f"arg{c}: {types[c]} vs {t}"
+            types[c] = t
+    assert None not in types, types
+    slices = [KernelSlice(ir, p, amap, extern_syms=_privates(ir)) for p, ir, amap, _ in parts]
+    module = stitch_elf("layer", [FuncArg(f"%arg{i}", t) for i, t in enumerate(types)], slices,
+                        debug_dump_path="/tmp/layer_eng_parse_error.mlir")
+
+    from air.ir import DenseI64ArrayAttr
+
+    per_launch = [ts for _, ir, _, ts in parts for _ in range(ir.count("air.launch "))]
+    func = next(
+        op for op in module.body.operations
+        if op.operation.name == "func.func" and op.attributes["sym_name"].value == "layer"
+    )
+    launches = [op for op in func.regions[0].blocks[0].operations if op.operation.name == "air.launch"]
+    assert len(launches) == len(per_launch), (len(launches), len(per_launch))
+    with module.context:
+        for op, ts in zip(launches, per_launch):
+            if ts:
+                op.attributes["air.shim_dma_tile_sizes"] = DenseI64ArrayAttr.get(ts)
+    print(f"  Engine layer module: {len(launches)} launches, {len(str(module).splitlines())} lines, parsed OK")
+    return module
+
+
 def build_multi_layer_module(rgr_ir, fa_ir, offn_ir, tilings, n_layers):
     single = build_layer_module(rgr_ir, fa_ir, offn_ir, tilings)
     types = _signature_types(str(single))

@@ -159,7 +159,7 @@ _BFP16_TILES = {"qkv": (80, 480, 160), "o": (80, 480, 160), "gu": (128, 480, 160
 
 
 # gemm_engine O+FFN tiles (--offn-engine): one tile_n / tile_k_l1 for O, GateUp and Down.
-_ENGINE = {"on": False, "tile_n": 80, "tile_k_l1": 160, "herd": 4}
+_ENGINE = {"on": False, "qkv": False, "tile_n": 80, "tile_k_l1": 160, "herd": 4}
 
 
 def _engine_offn_weights(lw, emb, hidden):
@@ -178,6 +178,57 @@ def _engine_offn_weights(lw, emb, hidden):
 
     return (pack(np.asarray(lw.wo).reshape(emb, emb)), pack(permute_gate_up(wg, wu, tn, tn * _ENGINE["herd"])),
             pack(np.asarray(lw.w_down).reshape(hidden, emb)))
+
+
+def _engine_qkv_args(lw, rope_lut_bf16, config, seq_len):
+    """w_qkv (attn_norm folded in, q/k heads pair-interleaved) packed for the
+    engine, and its RoPE table."""
+    from gemm_engine import qkv_col_perm, rope_table
+    from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import pack_b_bfp16ebs8
+
+    f32 = np.float32
+    nh, nkv, hd = config.n_heads, config.n_kv_heads, config.head_dim
+    w = np.concatenate([lw.wq, lw.wk, lw.wv], axis=1).astype(bfloat16).astype(f32)
+    nw = np.asarray(lw.attn_norm, dtype=bfloat16).astype(f32)[:, None]
+    wp = (nw * w).astype(bfloat16)[:, qkv_col_perm(nh, nkv, hd)]
+    table = rope_table(np.asarray(rope_lut_bf16[:seq_len], f32), nh, nkv, hd, nkv * hd).astype(bfloat16)
+    return pack_b_bfp16ebs8(np.ascontiguousarray(wp), _ENGINE["tile_n"], _ENGINE["tile_k_l1"]), table
+
+
+def run_layer_engine(x_bf16, layer_weights, rope_lut_bf16, config, cache, layer_idx=0, with_kv=False):
+    """One layer as the 3-launch engine ELF (layer_fused.build_engine_layer_module).
+    with_kv=True also returns the qkv buffer (q/k pair-interleaved; a view into a
+    shared BO, overwritten by the next call)."""
+    from layer_fused import ENG_LAYER_INTERMEDIATE, ENG_LAYER_OUT, ENG_LAYER_QKV, ENG_LAYER_STATIC
+
+    seq_len = x_bf16.shape[0]
+    emb, hidden = config.emb_dim, config.hidden_dim
+    kv = config.n_kv_heads * config.head_dim
+    _arg_cache = getattr(run_layer_engine, "_arg_cache", {})
+    run_layer_engine._arg_cache = _arg_cache
+    key = f"elayer_L{layer_idx}"
+    if key not in _arg_cache:
+        lw = layer_weights
+
+        def z(*shape):
+            return np.zeros(shape, dtype=bfloat16)
+
+        wqkv, table = _engine_qkv_args(lw, rope_lut_bf16, config, seq_len)
+        wo, wgu, wdn = _engine_offn_weights(lw, emb, hidden)
+        _arg_cache[key] = [None, wqkv, table, z(seq_len, emb + 2 * kv), _NPU_ATTN["mask"], z(seq_len, emb),
+                           wo, z(seq_len, emb), wgu, z(seq_len, hidden), wdn, z(seq_len, emb)]
+    args = _arg_cache[key]
+    args[0] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb)
+    results = cache.load_and_run(
+        "layer", _LAYER_BACKEND, *args,
+        output_indices=[ENG_LAYER_OUT, ENG_LAYER_QKV] if with_kv else [ENG_LAYER_OUT],
+        static_input_indices=ENG_LAYER_STATIC, intermediate_indices=ENG_LAYER_INTERMEDIATE, bo_key=key,
+        shared_nonstatic=True,
+    )
+    out = results[ENG_LAYER_OUT].reshape(seq_len, emb)
+    if with_kv:
+        return out, results[ENG_LAYER_QKV].reshape(seq_len, emb + 2 * kv)
+    return out
 
 
 def _weight(key, w):
@@ -282,7 +333,7 @@ def compile_backbone_kernels(
     fused_qkv=False, qkv_tile_n=80, gu_bstationary=False, qkv_bstationary=False,
     od_bstationary=False, od_tile_n=80, o_bstationary=None, dn_bstationary=None, dn_herd_m=None,
     dn_tile_m=32, dn_tile_n=None, offn_dup=(), gu_swiglu=False, npu_attn=False, fused_layer=False, fa_opt="-O2", layers_per_call=1,
-    fa_his=1, fa_qb=False, offn_engine=False,
+    fa_his=1, fa_qb=False, offn_engine=False, qkv_engine=False,
 ):
     """Replacement for llama32_1b_prefill.compile_all_kernels: that function
     hardcodes mm.o pre-compiles at tile_n=128 (llama32_1b's own registry
@@ -396,13 +447,27 @@ def compile_backbone_kernels(
                 32, tn, tk1, tn * herd, herd, herd, "_eng", "mm_engine.o", arg_order=OFFN_ENGINE_ORDER,
             )
             offn_tiling = []
-        cache.compile_and_cache(
-            "layer",
-            build_layer_module(str(rgr_mod), str(fa_mod), str(offn_mod),
-                               {"rgr": _TILING["rgr"], "fa": _FA_BACKEND["runtime_loop_tiling_sizes"],
-                                "offn": offn_tiling}, offn_engine=offn_engine),
-            {**_LAYER_BACKEND, "verbose": cache.verbose},
-        )
+        if qkv_engine:
+            from layer_fused import QKV_ENGINE_ORDER, build_engine_layer_module
+            from flash_attention.kernel_fusion_based.attn_npu2_seqfirst import build_module
+
+            hd, E = config.head_dim, config.emb_dim
+            qkv_eng = build_gemm_engine(
+                seq_len, [Job("x", "wqkv", "qkv", E, E + 2 * config.n_kv_heads * hd, rms=True, rope="rope")],
+                32, tn, tk1, tn * herd, herd, herd, "_eng", "mm_engine.o", arg_order=QKV_ENGINE_ORDER,
+            )
+            fa_fused = build_module(lk=seq_len, lkp=hd, lq=seq_len, lqp=seq_len, dk=hd, dv=hd,
+                                    num_q_tiles=seq_len // hd, num_cascade_stages=seq_len // hd,
+                                    num_heads=config.n_heads, num_kv_heads=config.n_kv_heads,
+                                    num_heads_per_unroll=1, causal=False, attn_mask=True, fused_qkv=True,
+                                    heads_in_segment=fa_his, q_bcast=fa_qb)
+            layer_mod = build_engine_layer_module(str(qkv_eng), str(fa_fused), str(offn_mod),
+                                                  _FA_BACKEND["runtime_loop_tiling_sizes"])
+        else:
+            layer_mod = build_layer_module(str(rgr_mod), str(fa_mod), str(offn_mod),
+                                           {"rgr": _TILING["rgr"], "fa": _FA_BACKEND["runtime_loop_tiling_sizes"],
+                                            "offn": offn_tiling}, offn_engine=offn_engine)
+        cache.compile_and_cache("layer", layer_mod, {**_LAYER_BACKEND, "verbose": cache.verbose})
         if layers_per_call > 1:
             from layer_fused import build_multi_layer_module
 
@@ -755,6 +820,8 @@ def main():
     ap.add_argument("--fa-his", type=int, default=1,
                     help="FA heads_in_segment: heads looped inside the segment per launch iteration")
     ap.add_argument("--fa-qb", action="store_true", help="FA q_bcast: Q on its own per-column channel")
+    ap.add_argument("--qkv-engine", action="store_true",
+                    help="with --offn-engine: rms+QKV+RoPE as one gemm_engine launch too (3-launch layer)")
     ap.add_argument("--offn-engine", action="store_true",
                     help="with --fused-layer: O+FFN as one gemm_engine launch instead of six")
     ap.add_argument("--compile-only", action="store_true")
@@ -796,8 +863,12 @@ def main():
         bfp_tag += "_qb"
     assert not args.offn_engine or (args.fused_layer and lpc == 1), "--offn-engine needs --fused-layer, 1 layer/call"
     _ENGINE["on"] = args.offn_engine
+    _ENGINE["qkv"] = args.qkv_engine
+    assert not args.qkv_engine or args.offn_engine, "--qkv-engine needs --offn-engine"
     if args.offn_engine:
         bfp_tag += "_offneng"
+    if args.qkv_engine:
+        bfp_tag += "_qkveng"
     sw_tag = "sw" if args.gu_swiglu else ""
     gu_tag = f"_fgu{args.gu_tile_n}{'bst' if args.gu_bstationary else ''}{sw_tag}{od_tag}{dup_tag}" if args.fused_gu else ""
     qkv_tag = f"_fqkv{args.qkv_tile_n}{'bst' if args.qkv_bstationary else ''}" if args.fused_qkv else ""
@@ -821,7 +892,7 @@ def main():
         dn_tile_m=args.dn_tile_m, dn_tile_n=args.dn_tile_n, offn_dup=offn_dup, gu_swiglu=args.gu_swiglu,
         npu_attn=args.npu_attn, fused_layer=args.fused_layer, fa_opt=args.fa_opt,
         layers_per_call=args.layers_per_call, fa_his=args.fa_his, fa_qb=args.fa_qb,
-        offn_engine=args.offn_engine,
+        offn_engine=args.offn_engine, qkv_engine=args.qkv_engine,
     )
     for name, override in (("o_ffn", args.offn_elf), ("rms_gemms_rope", args.rgr_elf)):
         if override:
@@ -861,6 +932,8 @@ def main():
     rope_lut_padded[SEQ_REAL:] = rope_lut_real[-1]
 
     def run_one_layer(xx, i, verbose=False):
+        if args.qkv_engine:
+            return run_layer_engine(xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache, layer_idx=i)
         if args.fused_layer:
             return run_layer_fused(xx, weights.layers[i], rope_lut_padded, BACKBONE_CONFIG, cache,
                                    layer_idx=i, gu_swiglu_half=sw_half)

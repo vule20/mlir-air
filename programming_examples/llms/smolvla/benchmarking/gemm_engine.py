@@ -47,6 +47,10 @@ class Job:
     swiglu: B's tile_n blocks hold tile_n/2 gate then tile_n/2 up columns; two
       consecutive output tiles fill the two halves of one tile_n-wide store, so
       n_out = n / 2 (B columns permuted on the host, see permute_gate_up).
+    rope: RoPE table P ([m, n] bf16, (cos, sin) per adjacent column pair, (1, 0)
+      to pass a pair through), riding the A channel like a residual. The rotation
+      acts on adjacent pairs, so head dims must be pair-interleaved in B (see
+      interleave_rope_heads). Needs rms (the scale is applied first).
     """
 
     a: str
@@ -57,6 +61,7 @@ class Job:
     residual: str = None
     rms: bool = False
     swiglu: bool = False
+    rope: str = None
 
     @property
     def n_out(self):
@@ -96,19 +101,22 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
 
     for j in jobs:
         assert j.n % l2_n == 0 and j.k % tk2 == 0
-        assert not j.residual or tk2 == l2_n, "a residual tile is one tile_k_l2 step"
+        assert not (j.residual or j.rope) or tk2 == l2_n, "a residual tile is one tile_k_l2 step"
+        assert not (j.residual and j.rope) and (not j.rope or (j.rms and not j.swiglu))
         assert not j.swiglu or (j.n // l2_n) % 2 == 0
         declare(j.a, [m, j.k], bf16)
         declare(j.b, [j.n // tile_n, j.k // tile_k_l1, tile_bytes], i8)
         if j.residual:
             declare(j.residual, [m, j.n_out], bf16)
+        if j.rope:
+            declare(j.rope, [m, j.n], bf16)
         declare(j.c, [m, j.n_out], bf16)
     arg_order = arg_order or list(shapes)
     assert sorted(arg_order) == sorted(shapes), (arg_order, list(shapes))
     T = {name: air.tensor(*shapes[name]) for name in arg_order}
 
     n_tiles = [(m // l2_m) * (j.n // l2_n) for j in jobs]
-    a_steps = sum(nt * (j.k // tk2 + bool(j.residual)) for nt, j in zip(n_tiles, jobs))
+    a_steps = sum(nt * (j.k // tk2 + bool(j.residual or j.rope)) for nt, j in zip(n_tiles, jobs))
     b_steps = sum(nt * (j.k // tk2) for nt, j in zip(n_tiles, jobs))
     c_tiles = sum(nt // (2 if j.swiglu else 1) for nt, j in zip(n_tiles, jobs))
 
@@ -120,6 +128,8 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
     drain_fn = ext("f32_to_bf16_mn")
     if any(j.residual for j in jobs):
         add_res = ext("add_residual_blocked", scalars=[i32])
+    if any(j.rope for j in jobs):
+        rope_fn = ext("rms_rope_blocked", scalars=[i32])
     if any(j.rms for j in jobs):
         zero_rows = ext("zero_rows")
         sumsq = ext("sumsq_rows_blocked")
@@ -128,7 +138,7 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
         swiglu_fn = ext("f32_to_bf16_rms_swiglu" if all(j.rms for j in jobs if j.swiglu) else "f32_to_bf16_swiglu_mn",
                         scalars=[i32])
         assert all(j.rms == jobs[[x.swiglu for x in jobs].index(True)].rms for j in jobs if j.swiglu)
-    assert all(not j.rms or j.swiglu for j in jobs), "rms is only implemented in the SwiGLU drain"
+    assert all(not j.rms or j.swiglu or j.rope for j in jobs), "rms is only in the SwiGLU and RoPE drains"
 
     a_in = air.channel("EngAIn", size=[herd_m])
     b_in = air.channel("EngBIn", size=[herd_n])
@@ -150,7 +160,7 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                         # air-isolate-async-dma-loop-nests gives every put its own loop nest,
                         # which would send all of a job's A steps before any residual step.
                         # Unrolled tile loops keep each tile's residual put right after its K steps.
-                        tile_loop = range if j.residual else air.sequential
+                        tile_loop = range if j.residual or j.rope else air.sequential
                         for li in tile_loop(m // l2_m):
                             for lj in tile_loop(j.n // l2_n):
                                 for k2 in air.sequential(j.k // tk2):
@@ -161,14 +171,15 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                 # await on a later job's task before this job's last A task deadlocks.
                                 # A residual tile is two A tasks (K steps, residual), so B is two too.
                                 k_steps = j.k // tk2
-                                halves = [(0, k_steps // 2), (k_steps // 2, k_steps)] if j.residual else [(0, k_steps)]
+                                halves = ([(0, k_steps // 2), (k_steps // 2, k_steps)] if j.residual or j.rope
+                                          else [(0, k_steps)])
                                 for lo, hi in halves:
                                     for k2 in air.sequential(lo, hi):
                                         for c in range(herd_n):
                                             kc = k2 * k_per_l2
                                             b_in.put(B[lj * herd_n + c, kc : kc + k_per_l2, :], indices=[c])
-                                if j.residual:
-                                    R = T[j.residual]
+                                if j.residual or j.rope:
+                                    R = T[j.residual or j.rope]
                                     for i in range(herd_m):
                                         row = li * l2_m + i * tile_m
                                         a_in.put(R[row : row + tile_m, lj * l2_n : lj * l2_n + l2_n], indices=[i])
@@ -228,13 +239,16 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                     matmul(l1_a, l1_b, acc)
                                 if stats:
                                     rows_rstd(ss)
-                                if j.residual:
+                                if j.residual or j.rope:
                                     # Core column c's output columns are A chunk c // 2, half c % 2.
                                     for ch in range(k_per_l2):
                                         a2l1.get(l1_a, indices=[tx, ty])
                                         for hf in range(tile_k_l1 // tile_n):
                                             with ops.branch(ty == ch * (tile_k_l1 // tile_n) + hf):
-                                                add_res(acc, l1_a, hf)
+                                                if j.rope:
+                                                    rope_fn(acc, ss, l1_a, hf)
+                                                else:
+                                                    add_res(acc, l1_a, hf)
                                 if j.swiglu:
                                     if j.rms:
                                         swiglu_fn(acc, ss, drain, half)
@@ -255,6 +269,13 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                         for _ in air.sequential(pairs - 1):
                                             tile(j, 0)
                                             tile(j, 1)
+                                            c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
+                                elif j.rms:
+                                    for _ in air.sequential(m // l2_m):
+                                        tile(j, stats=True)
+                                        c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
+                                        for _ in air.sequential(j.n // l2_n - 1):
+                                            tile(j)
                                             c2l2.put(drain.transpose(0, 1, 3, 4, 2, 5), indices=[tx, ty])
                                 elif j.swiglu:
                                     for _ in air.sequential(nt // 2):
@@ -289,6 +310,31 @@ def permute_gate_up(w_gate, w_up, tile_n, l2_n):
     w[:, nt * tile_n + i] = w_gate
     w[:, nt * tile_n + half + i] = w_up
     return w
+
+
+def rope_pair_perm(n_heads, head_dim):
+    """Column order pair-interleaving each head: new columns 2p, 2p+1 of a head
+    are its old p and p + head_dim/2 (the rotate-half partners)."""
+    h = head_dim // 2
+    local = np.stack([np.arange(h), np.arange(h) + h], axis=1).ravel()
+    return (np.arange(n_heads)[:, None] * head_dim + local).ravel()
+
+
+def qkv_col_perm(n_heads, n_kv_heads, head_dim):
+    """B / output column order of the rms+QKV+RoPE job: q and k heads
+    pair-interleaved, v unchanged. q.k per head is invariant (same permutation)."""
+    q, kv = n_heads * head_dim, n_kv_heads * head_dim
+    return np.concatenate([rope_pair_perm(n_heads, head_dim), q + rope_pair_perm(n_kv_heads, head_dim),
+                           q + kv + np.arange(kv)])
+
+
+def rope_table(lut, n_heads, n_kv_heads, head_dim, v_cols):
+    """lut [m, head_dim] = [cos | sin] per row -> the Job(rope=) table: (cos, sin)
+    per pair-interleaved q and k column pair, (1, 0) over the v columns."""
+    h = head_dim // 2
+    pair = np.stack([lut[:, :h], lut[:, h:]], axis=2).reshape(len(lut), head_dim)
+    v = np.tile(np.array([1.0, 0.0], np.float32), (len(lut), v_cols // 2))
+    return np.concatenate([np.tile(pair, (1, n_heads + n_kv_heads)), v], axis=1)
 
 
 def compile_mm_engine(tile_m, tile_n, tile_k_l1, sym_suffix, out_name, rms_k=960):
@@ -428,7 +474,7 @@ def main():
     ap.add_argument("--tk2", default="480,320", help="tile_k_l2 per job")
     ap.add_argument("--tk1", type=int, default=160)
     ap.add_argument("--tile-n", type=int, default=80)
-    ap.add_argument("--mode", default="engine", choices=["engine", "loads", "stitched", "ffn"])
+    ap.add_argument("--mode", default="engine", choices=["engine", "loads", "stitched", "ffn", "qkv"])
     ap.add_argument("--pingpong", default="", help="omit_pingpong value")
     ap.add_argument("--tiling", default="2,3", help="stitched launches' runtime_loop_tiling_sizes")
     ap.add_argument("--chmux", default="", help="air channel multiplexing memory spaces, e.g. L2 or L1,L2")
@@ -438,6 +484,8 @@ def main():
     args = ap.parse_args()
     if args.mode == "ffn":
         return main_ffn(args)
+    if args.mode == "qkv":
+        return main_qkv(args)
 
     from gemm_bfp16 import compile_mm_bfp16
     from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import pack_b_bfp16ebs8
@@ -597,6 +645,70 @@ def main_ffn(args):
     for _ in range(args.iters):
         run()
     dev = sorted(e["kernel_ms"] for e in cache.profiler.kernel_breakdowns["ffn"])
+    print(f"{tag}: device median {dev[len(dev) // 2] * 1e3:.0f} us (min {dev[0] * 1e3:.0f}, "
+          f"p10 {dev[len(dev) // 10] * 1e3:.0f})")
+
+
+def main_qkv(args):
+    """RMSNorm + QKV + RoPE as one engine job (q/k head dims pair-interleaved)."""
+    from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import pack_b_bfp16ebs8
+    from shared.infra.cache import KernelCache, Profiler
+
+    m, emb, nh, nkv, hd, tile_m, herd = 256, 960, 15, 5, 64, 32, 4
+    kv = nkv * hd
+    n = emb + 2 * kv
+    tn, tk1 = args.tile_n, args.tk1
+    tag = f"qkv_n{tn}_k{tk1}"
+    cache = KernelCache(str(_HERE / "build" / f"gemm_engine_{tag}"), verbose=False, profiler=Profiler(enabled=True))
+    sfx, obj = "_eng", "mm_engine.o"
+    compile_mm_engine(tile_m, tn, tk1, sfx, obj, rms_k=emb)
+    mod = build_gemm_engine(m, [Job("x", "wqkv", "qkv", emb, n, rms=True, rope="rope")],
+                            tile_m, tn, tk1, tn * herd, herd, herd, sfx, obj, arg_order=["x", "wqkv", "rope", "qkv"])
+    backend = {"verbose": False, "omit_while_true_loop": False, "output_format": "elf",
+               "instance_name": "gemm_engine", "debug_ir": args.debug_ir}
+    cache.compile_and_cache("qkv", mod, backend)
+
+    rng = np.random.default_rng(0)
+    f32 = np.float32
+
+    def bf(x):
+        return np.asarray(x, f32).astype(bfloat16)
+
+    x = bf(rng.standard_normal((m, emb)))
+    w = bf(rng.standard_normal((emb, n)) / np.sqrt(emb))
+    nw = bf(1.0 + 0.1 * rng.standard_normal(emb))
+    pos = np.minimum(np.arange(m), 240)
+    inv = 1.0 / (10000.0 ** (np.arange(0, hd, 2) / hd))
+    ang = np.outer(pos, inv)
+    lut = bf(np.concatenate([np.cos(ang), np.sin(ang)], axis=1))
+    perm = qkv_col_perm(nh, nkv, hd)
+    wp = bf(nw.astype(f32)[:, None] * w.astype(f32))[:, perm]
+    bufs = [x, pack_b_bfp16ebs8(wp, tn, tk1), bf(rope_table(lut.astype(f32), nh, nkv, hd, kv)),
+            np.zeros((m, n), bfloat16)]
+
+    def rope(a, heads):
+        a = a.reshape(m, heads, hd)
+        c, s_ = lut.astype(f32)[:, None, : hd // 2], lut.astype(f32)[:, None, hd // 2:]
+        a1, a2 = a[..., : hd // 2], a[..., hd // 2:]
+        return np.concatenate([a1 * c - a2 * s_, a2 * c + a1 * s_], axis=-1).reshape(m, -1)
+
+    xf = x.astype(f32)
+    ref = (xf / np.sqrt(np.mean(xf * xf, axis=1, keepdims=True) + 1e-5) * nw.astype(f32)) @ w.astype(f32)
+    ref = np.concatenate([rope(ref[:, :emb], nh), rope(ref[:, emb:emb + kv], nkv), ref[:, emb + kv:]], axis=1)
+    ref = ref[:, perm]
+
+    def run():
+        return cache.load_and_run("qkv", backend, *bufs, output_indices=[3], bo_key="qkv")
+
+    out = np.asarray(run()[3], f32).reshape(m, n)
+    from reconfig_probe import ctrl_kb
+    print(f"  control code {ctrl_kb(cache.cache_dir):.1f} KB")
+    for nm, sl in (("q", slice(0, emb)), ("k", slice(emb, emb + kv)), ("v", slice(emb + kv, n))):
+        print(f"  {nm}: cosine {_cos(out[:, sl], ref[:, sl]):.6f}")
+    cache.profiler.kernel_breakdowns.clear()
+    for _ in range(args.iters):
+        run()
+    dev = sorted(e["kernel_ms"] for e in cache.profiler.kernel_breakdowns["qkv"])
     print(f"{tag}: device median {dev[len(dev) // 2] * 1e3:.0f} us (min {dev[0] * 1e3:.0f}, "
           f"p10 {dev[len(dev) // 10] * 1e3:.0f})")
 
