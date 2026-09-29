@@ -1311,40 +1311,15 @@ static SmallVector<Operation *> getLaunchWindow(airrt::WaitAllOp launchEnd) {
   return window;
 }
 
-// Whether a host->device DMA of the window reads a memref one of its drains
-// writes: the launch reads back through host memory what it produced, e.g. a
-// chain of jobs sharing one activation buffer.
-static bool readsBackDrains(ArrayRef<Operation *> window,
-                            ArrayRef<airrt::DmaMemcpyNdOp> drainDmas) {
-  llvm::SmallPtrSet<Value, 4> drained;
-  for (auto dma : drainDmas)
-    drained.insert(dma.getMemref());
-  llvm::SmallPtrSet<Operation *, 16> drains;
-  for (auto dma : drainDmas)
-    drains.insert(dma);
-  for (Operation *op : window) {
-    bool found = false;
-    op->walk([&](airrt::DmaMemcpyNdOp dma) {
-      if (!drains.contains(dma) && drained.contains(dma.getMemref())) {
-        found = true;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-    if (found)
-      return true;
-  }
-  return false;
-}
-
-// Drain scheduling for a launch that reads back its own drains
-// (readsBackDrains): an input issued after a drain may read what that drain
-// writes, so the drain has to complete first -- deferring every drain wait to
-// the terminator lets such an input read stale host memory. Drains keep their
-// program order. On each shim channel, drains with no DMA between them form a
-// group; group g is awaited right after group g + 1 is armed, i.e. before the
-// inputs following g + 1. Each group is armed before the inputs that drive its
-// producer, and a channel queues at most two groups at once.
+// Drain scheduling for a launch that reads back its own drains and says so
+// (air.order_drains on its drains): an input issued after a drain may read what
+// that drain writes, so the drain has to complete first -- deferring every
+// drain wait to the terminator lets such an input read stale host memory.
+// Drains keep their program order. On each shim channel, drains with no DMA
+// between them form a group; group g is awaited right after group g + 1 is
+// armed, i.e. before the inputs following g + 1. Each group is armed before the
+// inputs that drive its producer, and a channel queues at most two groups at
+// once.
 static void orderDrainWaits(ArrayRef<Operation *> window,
                             ArrayRef<airrt::DmaMemcpyNdOp> drainDmas,
                             airrt::WaitAllOp launchEnd) {
@@ -1466,7 +1441,13 @@ static void deferDeviceToHostDrainWaits(ModuleOp module) {
     if (drainDmas.empty())
       return;
 
-    if (readsBackDrains(window, drainDmas)) {
+    // Opt-in: whether a launch reads its own drains back cannot be told from
+    // the memref alone (a GEMM that accumulates through host memory does, and
+    // the append barrier already orders it), so only a launch whose builder
+    // marks its drains air.order_drains is scheduled this way.
+    if (llvm::any_of(drainDmas, [](airrt::DmaMemcpyNdOp dma) {
+          return dma->hasAttr(air::attrs::OrderDrains);
+        })) {
       orderDrainWaits(window, drainDmas, launchEnd);
       return;
     }

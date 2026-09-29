@@ -3585,9 +3585,10 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
 
       // An ordered drain (air.ordered_drain) is armed, and an earlier one
       // awaited, right before the next feed, which may read what the awaited
-      // drain wrote. Such ops travel with that feed instead of ending the burst:
-      // cutting the burst there would stop the other channels' feeds from being
-      // woven in, and a cut per drain leaves them all after the last one.
+      // drain wrote. Such ops travel with that feed instead of ending the
+      // burst: cutting the burst there would stop the other channels' feeds
+      // from being woven in, and a cut per drain leaves them all after the last
+      // one.
       auto isOrderedDrainOp = [](Operation *o) {
         auto drainCfg = [](Value v) {
           auto cfg = v.getDefiningOp<AIEX::DMAConfigureTaskForOp>();
@@ -3642,9 +3643,8 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
             order.push_back(&kv);
           llvm::stable_sort(order, [](auto *a, auto *b) {
             auto carries = [](auto *kv) {
-              return llvm::any_of(kv->second, [](const Unit &u) {
-                return !u.prefix.empty();
-              });
+              return llvm::any_of(
+                  kv->second, [](const Unit &u) { return !u.prefix.empty(); });
             };
             return !carries(a) && carries(b);
           });

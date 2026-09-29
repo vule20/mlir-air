@@ -45,6 +45,10 @@ constexpr StringLiteral AppendBarrier = "air.append_barrier";
 // through host memory (air-to-std): the drain and the await air-to-std placed
 // on it stay in front of the next input feed when the feeds are interleaved.
 constexpr StringLiteral OrderedDrain = "air.ordered_drain";
+// Opt-in marker a builder puts on the device->host drains (air.channel.get) of
+// a launch that reads its own drains back through host memory; air-to-std then
+// keeps those drains in program order instead of deferring every wait.
+constexpr StringLiteral OrderDrains = "air.order_drains";
 constexpr StringLiteral PreserveShimDmaOrder = "air.preserve_shim_dma_order";
 // Marker on a shim MM2S configure task produced by the coalesce-shim-dma merge:
 // its BD covers a whole contiguous run merged from several smaller feeds, so
