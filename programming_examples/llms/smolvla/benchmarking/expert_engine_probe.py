@@ -47,13 +47,19 @@ BACKEND = {"verbose": False, "omit_while_true_loop": False, "output_format": "el
 PARTS = ("qkv", "s", "pv", "o", "gu", "dn")
 
 
-def layer_jobs(l, self_attn, parts=PARTS):
+def layer_jobs(l, self_attn, parts=PARTS, ondev=False):
+    """ondev: a self layer's own 50 keys come from its QKV job on the device (Job.own):
+    kb/vb hold the prefix only, and each P tile gains an own-key window."""
     s, nx = str(l), str(l + 1)
     mask = "mask_self" if self_attn else "mask_cross"
+    own = ondev and self_attn
+    kv = dict(kv="qkv" + s, kv_off=E) if own else {}
     jobs = {"qkv": [Job("x" + s, "wqkv" + s, "qkv" + s, E, E + 2 * KV, rms=True, rope="rope")],
-            "s": [Job("qkv" + s, f"kb{s}_{t}", f"p{s}_{t}", L2N, HPT * KP, residual=mask, exp=True, a_off=t * L2N)
+            "s": [Job("qkv" + s, f"kb{s}_{t}", f"p{s}_{t}", L2N, HPT * KP + (L2N if own else 0), residual=mask,
+                      exp=True, a_off=t * L2N, **(dict(own="s", head_t=t, **kv) if own else {}))
                   for t in range(NH // HPT)],
-            "pv": [Job(f"p{s}_{t}", f"vb{s}_{t}", "attn" + s, HPT * KP, 2 * L2N, div=True, c_off=t * L2N)
+            "pv": [Job(f"p{s}_{t}", f"vb{s}_{t}", "attn" + s, HPT * KP + (L2N if own else 0), 2 * L2N, div=True,
+                       c_off=t * L2N, **(dict(own="pv", head_t=t, **kv) if own else {}))
                    for t in range(NH // HPT)],
             "o": [Job("attn" + s, "wo" + s, "res1" + s, E, E, residual="x" + s)],
             "gu": [Job("res1" + s, "wgu" + s, "sw" + s, E, 2 * H, rms=True, swiglu=True)],
@@ -106,12 +112,21 @@ def make_layer(rng, self_attn):
 
 def layer_b(w):
     """The layer's B matrices (f32, [k, n]) by job-B suffix."""
-    f32 = np.float32
     wqkv = np.concatenate([w["wq"] / np.sqrt(HD), w["wk"], w["wv"]], axis=1)
     wqkv = (w["anorm"][:, None] * wqkv)[:, qkv_col_perm(NH, NKV, HD)]
-    kp = w["k"][:, rope_pair_perm(NKV, HD)]  # q/k dims are pair-interleaved on the device
-    valid = w["valid"] if "valid" in w else valid_keys(w["self_attn"])
     out = {"wqkv": wqkv}
+    out.update(attn_b(w["k"], w["v"], w["valid"] if "valid" in w else valid_keys(w["self_attn"])))
+    out["wo"] = w["wo"]
+    out["wgu"] = permute_gate_up(w["fnorm"][:, None] * w["wg"], w["fnorm"][:, None] * w["wu"], TN, L2N)
+    out["wdn"] = w["wd"]
+    return out
+
+
+def attn_b(k, v, valid):
+    """kb_t / vb_t (f32) from K, V [KP, KV] and the keys they hold, bool [KP]."""
+    f32 = np.float32
+    kp = k[:, rope_pair_perm(NKV, HD)]  # q/k dims are pair-interleaved on the device
+    out = {}
     for t in range(NH // HPT):
         kb = np.zeros((L2N, HPT * KP), f32)
         vb = np.zeros((HPT * KP, L2N), f32)
@@ -119,14 +134,31 @@ def layer_b(w):
         for j in range(HPT):
             g = (t * HPT + j) // (NH // NKV)
             kb[j * HD:(j + 1) * HD, j * KP:(j + 1) * KP] = (kp[:, g * HD:(g + 1) * HD] * valid[:, None]).T
-            vb[j * KP:(j + 1) * KP, j * HD:(j + 1) * HD] = w["v"][:, g * HD:(g + 1) * HD] * valid[:, None]
+            vb[j * KP:(j + 1) * KP, j * HD:(j + 1) * HD] = v[:, g * HD:(g + 1) * HD] * valid[:, None]
             ones[j * KP:(j + 1) * KP, j * HD:(j + 1) * HD] = valid[:, None]
         out[f"kb_{t}"] = kb
         out[f"vb_{t}"] = permute_gate_up(vb, ones, TN, L2N)
-    out["wo"] = w["wo"]
-    out["wgu"] = permute_gate_up(w["fnorm"][:, None] * w["wg"], w["fnorm"][:, None] * w["wu"], TN, L2N)
-    out["wdn"] = w["wd"]
     return out
+
+
+def engine_mask(m, n_pre=None):
+    """The engine's bool mask [M, width] for lerobot's m [M_REAL, keys] (True = attend). n_pre: m's
+    keys from n_pre on are the layer's own (Job(own="s")): each head's KP columns get the prefix,
+    then the own-key window in Job(own="s")'s column order (key group c, head, key)."""
+    mp = np.zeros((M, KP), bool)
+    mp[:M_REAL, :m.shape[1]] = m
+    own = None
+    if n_pre is not None:
+        own = np.zeros((M, M), bool)
+        own[:M_REAL, :M_REAL] = mp[:M_REAL, n_pre:n_pre + M_REAL]
+        own[M_REAL:] = own[M_REAL - 1]
+        mp[:, n_pre:] = False
+    mp[M_REAL:] = mp[M_REAL - 1]  # padded rows: any non-empty row, so P.1 > 0
+    if own is None:
+        return mp
+    # Key 16c + key, the same for every head.
+    own = np.repeat(own.reshape(M, HERD, 1, TILE_M), HPT, axis=2).reshape(M, L2N)
+    return np.concatenate([np.tile(mp, (1, HPT)), own], axis=1)
 
 
 def reference_layer(x, w, lut):
@@ -172,12 +204,14 @@ class RealData:
         self.d = dict(np.load(ec.CAPTURE))
         self.n_steps = len(self.d["x"])
 
-    def step(self, s, n_layers):
-        return self.step_from({key: self.d[key][s] for key in ("x", "k", "v", "mask", "pos")}, n_layers)
+    def step(self, s, n_layers, ondev=0):
+        return self.step_from({key: self.d[key][s] for key in ("x", "k", "v", "mask", "pos")}, n_layers, ondev)
 
-    def step_from(self, r, n_layers):
+    def step_from(self, r, n_layers, ondev=0):
         """(padded layer dicts, {mask name: bool [M, KP]}, x0 [M_REAL, E_REAL], fp32 chain) for one
-        denoising call r (x, k, v, mask, pos as in the capture)."""
+        denoising call r (x, k, v, mask, pos as in the capture). ondev: self layers l < ondev have K/V
+        the prefix only, and mask_self is [M, HPT * KP + L2N]: the prefix mask per head,
+        then the own-key mask in Job(own="s")'s column order (key group c, head, key)."""
         ec = self.ec
         chain = []
         ec.reference_expert(r["x"], self.layers[:n_layers], self.meta, r["k"], r["v"], r["mask"], r["pos"],
@@ -191,11 +225,8 @@ class RealData:
                            wq=pad(w["wq"], (E, NH * HD)), wk=pad(w["wk"], (E, KV)), wv=pad(w["wv"], (E, KV)),
                            wo=pad(w["wo"], (NH * HD, E)), wg=pad(w["wg"], (E, H)), wu=pad(w["wu"], (E, H)),
                            wd=pad(w["wd"], (H, E)), k=bf(pad(k, (KP, KV))), v=bf(pad(v, (KP, KV))),
-                           valid=np.arange(KP) < len(k), self_attn=sa))
-            mp = np.zeros((M, KP), bool)
-            mp[:M_REAL, :m.shape[1]] = m
-            mp[M_REAL:] = mp[M_REAL - 1]  # padded rows: any non-empty row, so P.1 > 0
-            masks["mask_self" if sa else "mask_cross"] = mp
+                           valid=np.arange(KP) < (len(r["k"][l]) if l < ondev and sa else len(k)), self_attn=sa))
+            masks["mask_self" if sa else "mask_cross"] = engine_mask(m, len(r["k"][l]) if l < ondev and sa else None)
         return ws, masks, r["x"], chain
 
     def chunk(self, expert):
@@ -245,11 +276,15 @@ def main():
     ap.add_argument("--parts", default=",".join(PARTS), help="job kinds per layer (bisecting)")
     ap.add_argument("--real", action="store_true", help="SmolVLA weights + captured steps (expert_capture.py)")
     ap.add_argument("--dump", help="save every arena tensor of each step to DUMP/step{s}.npz")
+    ap.add_argument("--ondev", action="store_true", help="with --real: self layers' own K/V computed on the device")
+    ap.add_argument("--ondev-layers", type=int, help="with --ondev: only the first N layers (bisecting)")
+    ap.add_argument("--arena-pad", type=int, default=0, help="unused arena tiles per herd row (probing)")
     ap.add_argument("--closed-loop", action="store_true",
                     help="with --real at all layers: lerobot's denoising loop driven by the NPU expert")
     args = ap.parse_args()
     parts = args.parts.split(",")
     full = set(parts) == set(PARTS)
+    assert args.real or not args.ondev, "--ondev checks against the real fp32 chain"
     real = RealData() if args.real else None
     from matrix_multiplication.bf16_x_bfp16.matmul_bf16_x_bfp16 import pack_b_bfp16ebs8
     from reconfig_probe import ctrl_kb
@@ -259,22 +294,23 @@ def main():
     bfa = lambda a: np.asarray(a, np.float32).astype(bfloat16)  # noqa: E731
     lut = bfa(rope_lut()).astype(np.float32)
     for n_layers in args.layers:
+        ondev_n = (n_layers if args.ondev_layers is None else args.ondev_layers) if args.ondev else 0
         if real:
-            ws, masks, x0_real, chain = real.step(0, n_layers)
+            ws, masks, x0_real, chain = real.step(0, n_layers, ondev_n)
         else:
             rng = np.random.default_rng(0)
             ws = [make_layer(rng, l % 2 == 1) for l in range(n_layers)]
             masks = {nm: np.tile(valid_keys(sa), (M, 1)) for nm, sa in (("mask_cross", False), ("mask_self", True))}
-        jobs = [j for l in range(n_layers) for j in layer_jobs(l, ws[l]["self_attn"], parts)]
-        lay = arena_layout(M, jobs, TILE_M, HERD, L2N)
+        jobs = [j for l in range(n_layers) for j in layer_jobs(l, ws[l]["self_attn"], parts, l < ondev_n)]
+        lay = arena_layout(M, jobs, TILE_M, HERD, L2N, args.arena_pad)
         wbase, wrows = weights_layout(jobs, TN, L2N)
-        tag = ("" if full else "_" + "-".join(parts)) + ("_sl" if args.shim_at_launch else "")
+        tag = ("" if full else "_" + "-".join(parts)) + ("_sl" if args.shim_at_launch else "") + (f"_ondev{ondev_n if ondev_n < n_layers else ''}" if ondev_n else "") + (f"_pad{args.arena_pad}" if args.arena_pad else "")
         cache = KernelCache(str(Path(__file__).resolve().parent / "build" / f"expert_engine_L{n_layers}{tag}"),
                             verbose=False, profiler=Profiler(enabled=True))
         backend = dict(BACKEND, verbose=args.verbose)
         module = build_gemm_engine(M, jobs, TILE_M, TN, TK1, L2N, HERD, HERD, SFX, OBJ,
                                    arg_order=["wts", "act"], arena="act", weights="wts",
-                                   shim_at_launch=args.shim_at_launch)
+                                   shim_at_launch=args.shim_at_launch, arena_pad=args.arena_pad)
         try:
             elf = cache.cache_dir / "eng.elf"
             if args.run_only and elf.exists():
@@ -313,7 +349,7 @@ def main():
                 lay.pack(act, "rope", bfa(rope_table(lut, NH, NKV, HD, KV)))
             for nm, mk in masks.items():
                 if nm in lay.base:
-                    lay.pack(act, nm, bfa(np.tile(np.where(mk, 0.0, -1e30), (1, HPT))))
+                    lay.pack(act, nm, bfa(np.tile(np.where(mk, 0.0, -1e30), (1, lay.width[nm] // mk.shape[1]))))
             if not full:  # a job subset: inputs normally produced by the missing jobs
                 rng_in = np.random.default_rng(2)
                 for nm in lay.base:
@@ -359,14 +395,14 @@ def main():
         elif real:
             print(f"L={n_layers} step 0: {check(got, x0, ws, 0, chain)}")
             for s in range(1, real.n_steps):
-                ws_s, masks_s, xs, chain_s = real.step(s, n_layers)
+                ws_s, masks_s, xs, chain_s = real.step(s, n_layers, ondev_n)
                 x0_s = bfa(pad(xs, (M, E)))
                 got_s = np.asarray(cache.load_and_run("eng", backend, pack_weights(ws_s), pack_act(x0_s, masks_s),
                                                       output_indices=[1], bo_key="xe")[1]).reshape(act.shape)
                 print(f"L={n_layers} step {s}: {check(got_s, x0_s, ws_s, s, chain_s)}")
             if args.closed_loop and n_layers == len(real.layers):
                 def npu_expert(r):
-                    ws_r, masks_r, xr, _ = real.step_from(r, n_layers)
+                    ws_r, masks_r, xr, _ = real.step_from(r, n_layers, ondev_n)
                     g = np.asarray(cache.load_and_run("eng", backend, pack_weights(ws_r),
                                                       pack_act(bfa(pad(xr, (M, E))), masks_r),
                                                       output_indices=[1], bo_key="xe")[1]).reshape(act.shape)

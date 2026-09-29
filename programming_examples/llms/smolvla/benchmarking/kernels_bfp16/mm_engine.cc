@@ -27,6 +27,103 @@
 #ifndef RMS_EPS
 #define RMS_EPS 1e-5f
 #endif
+// Own-key attention geometry (gemm_engine.py OWN_*): head dim, q heads per kv
+// group, kv groups, and q heads per DIM_K-pair (one arena tile). One key per
+// tile row: only the 16-row build (the expert) has own-key jobs.
+#if DIM_M == 16
+#define OWN_HD 64
+#define OWN_QPG 3
+#define OWN_NKV 5
+#define OWN_HPT (2 * DIM_K / OWN_HD)
+#define OWN_VW 144
+#define OWN_VR 25
+
+// 8 rows of 8 bf16 (row stride `stride` elements) as one row-major 8x8 block.
+static inline aie::vector<bfloat16, 64> load_block_8x8(const bfloat16 *p,
+                                                       unsigned stride) {
+  return aie::concat(aie::load_v<8>(p), aie::load_v<8>(p + stride),
+                     aie::load_v<8>(p + 2 * stride),
+                     aie::load_v<8>(p + 3 * stride),
+                     aie::load_v<8>(p + 4 * stride),
+                     aie::load_v<8>(p + 5 * stride),
+                     aie::load_v<8>(p + 6 * stride),
+                     aie::load_v<8>(p + 7 * stride));
+}
+
+static inline aie::block_vector<bfp16ebs8, 64>
+to_bfp16(const aie::vector<bfloat16, 64> &v) {
+  aie::accum<accfloat, 64> a;
+  a.from_vector(v);
+  return a.to_vector<bfp16ebs8>();
+}
+
+// acc block (nb, mb) += A block (mb, kb) x B block (n rows by k columns).
+static inline void mac_block(float *acc, const bfloat16 *a, unsigned nb,
+                             unsigned mb, unsigned kb,
+                             const aie::block_vector<bfp16ebs8, 64> &b) {
+  constexpr unsigned MB = DIM_M / 8, KB = DIM_K / 8, BE = 64;
+  float *pc = acc + (nb * MB + mb) * BE;
+  aie::accum<accfloat, 64> c(aie::load_v<64>(pc));
+  c = mac_8x8_8x8T(to_bfp16(aie::load_v<64>(a + (mb * KB + kb) * BE)), b, c);
+  aie::store_v(pc, c.template to_vector<float>());
+}
+
+// Scores against the step's own keys, one DIM_K chunk kc of Q tile t (A). b is
+// this core column's DIM_M keys of the K arena tile, row-major [DIM_M][2*DIM_K]
+// over all kv groups (then padding). Output block nb = head * 2 + key half.
+static void own_scores(bfloat16 *a, uint8_t *b_bytes, float *acc, unsigned kc,
+                       unsigned t) {
+  constexpr unsigned T = 8, MB = DIM_M / T, KB = DIM_K / T, W = 2 * DIM_K;
+  static_assert(DIM_M == 16 && DIM_N == 2 * OWN_HPT * T, "16 keys x 5 heads");
+  ::aie::set_rounding(round_mode);
+  const bfloat16 *b = reinterpret_cast<const bfloat16 *>(b_bytes);
+  for (unsigned kb = 0; kb < KB; kb++) {
+    const unsigned d = kc * DIM_K + kb * T, j = d / OWN_HD;
+    const unsigned g = (t * OWN_HPT + j) / OWN_QPG;
+    for (unsigned kg = 0; kg < 2; kg++) {
+      const auto bq =
+          to_bfp16(load_block_8x8(b + kg * T * W + g * OWN_HD + d % OWN_HD, W));
+      for (unsigned mb = 0; mb < MB; mb++)
+        mac_block(acc, a, j * 2 + kg, mb, kb, bq);
+    }
+  }
+}
+
+// P_own . V for one DIM_K chunk kc of P_own (A: columns key group 2kc + kb/10,
+// head, key half, as own_scores writes them). b is V of herd rows 2kc,
+// 2kc+1 as [2][OWN_VR][OWN_VW] (rows past DIM_M are padding), columns col0..
+// (gemm_engine.own_pv_col0). Core column `col`, output half `half`: blocks
+// 0..NB/2 are P.V for output dims col*DIM_N + half*DIM_N/2 + .., blocks NB/2..
+// the matching P.1 sums.
+static void own_pv(bfloat16 *a, uint8_t *b_bytes, float *acc, unsigned kc,
+                   unsigned t, unsigned col, unsigned half) {
+  constexpr unsigned T = 8, MB = DIM_M / T, H = DIM_N / T / 2;
+  constexpr unsigned W = OWN_VW, KEYS = DIM_M, TW = 2 * DIM_K;
+  static_assert(DIM_M == 16 && DIM_K == 2 * OWN_HPT * KEYS, "2 key groups");
+  ::aie::set_rounding(round_mode);
+  const bfloat16 *b = reinterpret_cast<const bfloat16 *>(b_bytes);
+  const unsigned o0 = col * DIM_N + half * (DIM_N / 2);
+  unsigned col0 = (t * OWN_HPT + o0 / OWN_HD) / OWN_QPG * OWN_HD;
+  if (col0 > TW - W)
+    col0 = TW - W;
+  const auto ones = to_bfp16(aie::broadcast<bfloat16, 64>((bfloat16)1.0f));
+  for (unsigned nb = 0; nb < H; nb++) {
+    const unsigned o = o0 + nb * T, j = o / OWN_HD;
+    const unsigned vc = (t * OWN_HPT + j) / OWN_QPG * OWN_HD + o % OWN_HD - col0;
+    for (unsigned cl = 0; cl < 2; cl++) {
+      for (unsigned kg = 0; kg < 2; kg++) {
+        const unsigned kb = cl * OWN_HPT * 2 + j * 2 + kg;
+        const bfloat16 *pb = b + (cl * OWN_VR + kg * T) * W + vc;
+        const auto bq = to_bfp16(aie::transpose(load_block_8x8(pb, W), 8, 8));
+        for (unsigned mb = 0; mb < MB; mb++) {
+          mac_block(acc, a, nb, mb, kb, bq);
+          mac_block(acc, a, nb + H, mb, kb, ones);
+        }
+      }
+    }
+  }
+}
+#endif
 
 extern "C" {
 
@@ -221,5 +318,21 @@ void SYM(f32_to_bf16_div_mn)(float *src, bfloat16 *dst, int32_t half) {
     }
   }
 }
+
+#if DIM_M == 16
+// GEMM step of a job with own-key tiles (gemm_engine Job.own): the packed
+// matmul unless `own`, else kind 1 scores / kind 2 P.V against the own keys, on
+// DIM_K chunk ch & 1 of the own step.
+void SYM(matmul_engine_own)(bfloat16 *a, uint8_t *b, float *acc, int32_t kind,
+                            int32_t own, int32_t ch, int32_t t, int32_t col,
+                            int32_t half) {
+  if (!own)
+    matmul_bf16_x_bfp16_packed_f32(a, b, acc);
+  else if (kind == 1)
+    own_scores(a, b, acc, ch & 1, t);
+  else
+    own_pv(a, b, acc, ch & 1, t, col, half);
+}
+#endif
 
 } // extern "C"
