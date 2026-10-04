@@ -257,7 +257,11 @@ def get_expert_runtime(policy, profile=False):
         bench = str(_HERE / "benchmarking")
         if bench not in sys.path:
             sys.path.insert(0, bench)
-        from expert_runtime import ExpertRuntime
+        if os.environ.get("SMOLVLA_NPU_EXPERT_V2", "0") == "1":
+            # No host K/V packing: a prefix engine + step engine (benchmarking/expert_runtime_v2.py).
+            from expert_runtime_v2 import ExpertRuntimeV2 as ExpertRuntime
+        else:
+            from expert_runtime import ExpertRuntime
 
         rt = _EXPERT_RT[id(policy)] = ExpertRuntime(policy, profile=profile)
     return rt

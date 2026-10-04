@@ -67,6 +67,44 @@ def layer_jobs(l, self_attn, parts=PARTS, ondev=False):
     return [j for p in PARTS if p in parts for j in jobs[p]]
 
 
+PRE_PASSES = 4  # 64-key passes of the 241 prefix keys (256 slots)
+
+
+def layer_jobs_v2(l, self_attn, parts=PARTS, prefix_passes=PRE_PASSES):
+    """The layer without any host-packed K/V: every key is read as bf16 from an arena tile through
+    the B channel (Job.own). The prefix K|V tiles `kvp{l}_{p}` come from the prefix engine
+    (prefix_jobs_v2, the step engine's external `kv` argument); a self layer's own 50 keys are the
+    qkv job's K|V tiles in the step arena (the last pass). Cross layers need only Q from the qkv job."""
+    s, nx = str(l), str(l + 1)
+    mask = "mask_self" if self_attn else "mask_cross"
+    srcs = tuple((f"kvp{s}_{p}", 0) for p in range(prefix_passes)) + ((("qkv" + s, E),) if self_attn else ())
+    n_p = len(srcs)
+    own = dict(own_passes=n_p, kv="kvp" + s, kv_srcs=srcs)
+    jobs = {"qkv": [Job("x" + s, ("wqkv" if self_attn else "wq") + s, "qkv" + s, E, E + (2 * KV if self_attn else 0),
+                        rms=True, rope="rope")],
+            "s": [Job("qkv" + s, "kbn", f"p{s}_{t}", L2N, n_p * L2N, residual=mask, exp=True, a_off=t * L2N,
+                      own="s", head_t=t, **own) for t in range(NH // HPT)],
+            "pv": [Job(f"p{s}_{t}", "vbn", "attn" + s, n_p * L2N, 2 * L2N, div=True, c_off=t * L2N,
+                       own="pv", head_t=t, **own) for t in range(NH // HPT)],
+            "o": [Job("attn" + s, "wo" + s, "res1" + s, E, E, residual="x" + s)],
+            "gu": [Job("res1" + s, "wgu" + s, "sw" + s, E, 2 * H, rms=True, swiglu=True)],
+            "dn": [Job("sw" + s, "wdn" + s, "x" + nx, H, E, residual="res1" + s)]}
+    return [j for p in PARTS if p in parts for j in jobs[p]]
+
+
+def prefix_jobs_v2(self_flags, prefix_passes=PRE_PASSES):
+    """The prefix engine, once per chunk: kvp{l}_{p} = [kc{l}_{p} @ WK | vc{l}_{p} @ WV] for 64 keys per pass.
+    Cross layers: the expert's k/v projections (columns pair-interleaved like Q). Self layers: K is the
+    backbone's K rotated by -p0 (one 320 x 320 block-diagonal matrix `wr`, built per chunk, columns
+    pair-interleaved) and V is copied (identity `wid`)."""
+    jobs = []
+    for l, self_attn in enumerate(self_flags):
+        for p in range(prefix_passes):
+            jobs += [Job(f"kc{l}_{p}", "wr" if self_attn else f"wk{l}", f"kvp{l}_{p}", L2N, L2N),
+                     Job(f"vc{l}_{p}", "wid" if self_attn else f"wv{l}", f"kvp{l}_{p}", L2N, L2N, c_off=L2N)]
+    return jobs
+
+
 def pad(a, shape):
     out = np.zeros(shape, np.float32)
     out[tuple(slice(0, n) for n in a.shape)] = a
