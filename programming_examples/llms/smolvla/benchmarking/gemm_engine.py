@@ -17,6 +17,8 @@ is the first per-job ops.load version, kept because it shows why the channel
 version is needed.
 """
 import argparse
+import os
+from contextlib import ExitStack, nullcontext
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +50,8 @@ def _order_drain():
     input reads rows an earlier job's drain wrote. air-to-std then has to keep the
     drains in program order instead of deferring every wait to the launch end; that is
     opt-in per launch, by marking its drains."""
+    if os.environ.get("ENGINE_NO_ORDER_DRAINS"):  # repro: leave the drains unmarked
+        return
     from air.ir import InsertionPoint, UnitAttr
 
     ops = InsertionPoint.current.block.operations
@@ -488,31 +492,50 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                             for kk in range(k_per_l2):
                                 b2l1.put(l2_b[c][kk, :], indices=[0, c])
 
+                    RJ = os.environ.get("ENGINE_RJ", "gu,qkv,pair")  # experiment: which kinds loop
+
                     def run_job(j, nt, tile, emit):
                         if j.swiglu and j.rms:
-                            # The row statistics depend on the row block only: gathered on its
-                            # first tile's K pass, reused by the rest (tiles are li-major).
                             pairs = j.n // l2_n // 2
-                            for _ in air.sequential(m // l2_m):
-                                tile(j, 0, stats=True)
-                                tile(j, 1)
-                                emit()
-                                for _ in air.sequential(pairs - 1):
+                            if "gu" in RJ:
+                                for _ in air.sequential(m // l2_m):
+                                    for pr in air.sequential(pairs):
+                                        for hf in air.sequential(2):
+                                            tile(j, hf, stats=[pr == 0, hf == 0])
+                                        emit()
+                            else:
+                                for _ in air.sequential(m // l2_m):
+                                    tile(j, 0, stats=True)
+                                    tile(j, 1)
+                                    emit()
+                                    for _ in air.sequential(pairs - 1):
+                                        tile(j, 0)
+                                        tile(j, 1)
+                                        emit()
+                        elif j.rms:
+                            if "qkv" in RJ:
+                                for _ in air.sequential(m // l2_m):
+                                    for tn_ in air.sequential(j.n // l2_n):
+                                        tile(j, stats=[tn_ == 0])
+                                        emit()
+                            else:
+                                for _ in air.sequential(m // l2_m):
+                                    tile(j, stats=True)
+                                    emit()
+                                    for _ in air.sequential(j.n // l2_n - 1):
+                                        tile(j)
+                                        emit()
+                        elif j.paired:
+                            if "pair" in RJ:
+                                for _ in air.sequential(nt // 2):
+                                    for hf in air.sequential(2):
+                                        tile(j, hf)
+                                    emit()
+                            else:
+                                for _ in air.sequential(nt // 2):
                                     tile(j, 0)
                                     tile(j, 1)
                                     emit()
-                        elif j.rms:
-                            for _ in air.sequential(m // l2_m):
-                                tile(j, stats=True)
-                                emit()
-                                for _ in air.sequential(j.n // l2_n - 1):
-                                    tile(j)
-                                    emit()
-                        elif j.paired:
-                            for _ in air.sequential(nt // 2):
-                                tile(j, 0)
-                                tile(j, 1)
-                                emit()
                         else:
                             assert not j.own or m == l2_m, "own tile index = output tile index"
                             for tix in air.sequential(nt):
@@ -533,16 +556,27 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
 
                             head = [0]  # the running own job's head_t (a core loop index)
 
+                            def when(conds):
+                                # conds: True (always), or dynamic conditions that must all hold
+                                if conds is True:
+                                    return nullcontext()
+                                stack = ExitStack()
+                                for c in conds:
+                                    stack.enter_context(ops.branch(c))
+                                return stack
+
                             def tile(j, half=None, stats=False, tix=None):
                                 zero_acc(acc)
                                 if stats:
-                                    zero_rows(ss)
+                                    with when(stats):
+                                        zero_rows(ss)
                                 n_ch = j.k // tile_k_l1
                                 for ch in air.sequential(n_ch):
                                     a2l1.get(l1_a, indices=[tx, ty])
                                     b2l1.get(l1_b, indices=[tx, ty])
                                     if stats:
-                                        sumsq(l1_a, ss)
+                                        with when(stats):
+                                            sumsq(l1_a, ss)
                                     if j.own:
                                         own = (tix == j.n // l2_n - 1) if j.own == "s" else (ch >= n_ch - k_per_l2)
                                         own_fn(l1_a, l1_b, acc, 1 if j.own == "s" else 2, own, ch, head[0], ty,
@@ -550,17 +584,19 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                     else:
                                         matmul(l1_a, l1_b, acc)
                                 if stats:
-                                    rows_rstd(ss)
+                                    with when(stats):
+                                        rows_rstd(ss)
                                 if j.residual or j.rope:
                                     # Core column c's output columns are A chunk c // 2, half c % 2.
-                                    for ch in range(k_per_l2):
+                                    hpc = tile_k_l1 // tile_n
+                                    for ch in air.sequential(k_per_l2):
                                         a2l1.get(l1_a, indices=[tx, ty])
-                                        for hf in range(tile_k_l1 // tile_n):
-                                            with ops.branch(ty == ch * (tile_k_l1 // tile_n) + hf):
-                                                if j.rope:
-                                                    rope_fn(acc, ss, l1_a, hf)
-                                                else:
-                                                    add_res(acc, l1_a, hf)
+                                        # one call site: core ty takes half ty % hpc of chunk ty // hpc
+                                        with ops.branch(ty // hpc == ch):
+                                            if j.rope:
+                                                rope_fn(acc, ss, l1_a, ty % hpc)
+                                            else:
+                                                add_res(acc, l1_a, ty % hpc)
                                 if j.swiglu:
                                     if j.rms:
                                         swiglu_fn(acc, ss, drain, half)
@@ -657,13 +693,14 @@ def compile_mm_engine(tile_m, tile_n, tile_k_l1, sym_suffix, out_name, rms_k=960
         f"-I{_PROJ_ROOT / 'matrix_multiplication' / 'bf16_x_bfp16'}",
         f"-DDIM_M={tile_m}", f"-DDIM_N={tile_n}", f"-DDIM_K={tile_k_l1}",
         f"-DSYM_SUFFIX={sym_suffix}", f"-DRMS_K={rms_k}", "-Wno-macro-redefined",
-    ]
+        "-O3",  # -O2 (the shared default) makes the own-key attention jobs ~2x slower
+    ] + os.environ.get("ENGINE_KERNEL_FLAGS", "").split()
     # Rebuilt only when stale: the kernel cache keys ELFs on the object's mtime, so an
     # unconditional rebuild recompiles every cached engine (tens of minutes for many jobs).
     # An out_name must keep one set of flags.
     srcs = [_HERE / "kernels_bfp16" / n for n in ("mm_engine.cc", "mm_bfp16.cc")]
     obj = Path(out_name)
-    stale = not obj.exists() or max(s.stat().st_mtime for s in srcs) > obj.stat().st_mtime
+    stale = bool(os.environ.get("ENGINE_KERNEL_FLAGS")) or not obj.exists() or max(s.stat().st_mtime for s in srcs) > obj.stat().st_mtime
     _compile_kernel(srcs[0], out_name, extra_flags=extra, force=stale)
 
 
