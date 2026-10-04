@@ -68,12 +68,20 @@ class ExpertRuntimeV2:
             for nm in elf:
                 self.cache.artifacts[nm] = XRTCompileArtifact(str(elf[nm]), "main:gemm_engine", None)
         else:
-            self.cache.compile_and_cache("pre", build_gemm_engine(
-                M, jobs_pre, TILE_M, TN, TK1, L2N, HERD, HERD, xp.SFX, xp.OBJ, arg_order=["wts", "act"], arena="act",
-                weights="wts", shim_at_launch=True), self.backend)
-            self.cache.compile_and_cache("step", build_gemm_engine(
-                M, jobs, TILE_M, TN, TK1, L2N, HERD, HERD, xp.SFX, xp.OBJ, arg_order=["wts", "act", "kv"], arena="act",
-                weights="wts", shim_at_launch=True, kv_arena="kv", kv_lay=self.lay_pre), self.backend)
+            try:
+                self.cache.compile_and_cache("pre", build_gemm_engine(
+                    M, jobs_pre, TILE_M, TN, TK1, L2N, HERD, HERD, xp.SFX, xp.OBJ, arg_order=["wts", "act"],
+                    arena="act", weights="wts", shim_at_launch=True), self.backend)
+                self.cache.compile_and_cache("step", build_gemm_engine(
+                    M, jobs, TILE_M, TN, TK1, L2N, HERD, HERD, xp.SFX, xp.OBJ, arg_order=["wts", "act", "kv"],
+                    arena="act", weights="wts", shim_at_launch=True, kv_arena="kv", kv_lay=self.lay_pre),
+                    self.backend)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"the expert engine ELFs are not in {self.cache.cache_dir} and building them failed "
+                    f"({str(e).splitlines()[-1][:200]}). Build them once with `make compile-expert`, with a compiler "
+                    "that honours air.order_drains first on PATH (and its python on PYTHONPATH) and PEANO_INSTALL_DIR "
+                    'at a no-unroll Peano; see the README, "Experimental: backbone and expert on the NPU".') from e
 
         nbytes = self._pack_b(_bf(np.zeros((L2N, TN))), TN, TK1).shape[-1]
         self.wts = np.zeros((wrows, L2N // TK1, nbytes), np.uint8)

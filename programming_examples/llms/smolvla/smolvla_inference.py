@@ -110,10 +110,14 @@ EXPERT_KV_MEMO = os.environ.get("SMOLVLA_EXPERT_KV_MEMO", "1") == "1"
 #   SMOLVLA_NPU_BACKBONE (default 0) EXPERIMENTAL: run the backbone's prefix fill
 #                       on the NPU too (benchmarking/backbone_runtime.py), the
 #                       default for run_hybrid_forward's npu_backbone.
-NPU_BACKBONE = os.environ.get("SMOLVLA_NPU_BACKBONE", "0") == "1"
+#   SMOLVLA_NPU_ALL (default 0) EXPERIMENTAL: all three stages on the NPU: the two switches below
+#                       plus the expert without host K/V packing (expert_runtime_v2.py). The
+#                       --npu-all flag and `make run-all / verify-all / profile-all` set it.
+NPU_ALL = os.environ.get("SMOLVLA_NPU_ALL", "0") == "1"
+NPU_BACKBONE = os.environ.get("SMOLVLA_NPU_BACKBONE", "0") == "1" or NPU_ALL
 #   SMOLVLA_NPU_EXPERT (default 0) EXPERIMENTAL: run the action expert's ten
 #                       denoising calls on the NPU too (benchmarking/expert_runtime.py).
-NPU_EXPERT = os.environ.get("SMOLVLA_NPU_EXPERT", "0") == "1"
+NPU_EXPERT = os.environ.get("SMOLVLA_NPU_EXPERT", "0") == "1" or NPU_ALL
 
 DEFAULT_MODEL = "lerobot/smolvla_base"
 DEFAULT_PROMPT = "pick up the cube"
@@ -139,7 +143,10 @@ def build_config(npu_vision: bool = True) -> dict:
         "model": DEFAULT_MODEL,
         "prompt": DEFAULT_PROMPT,
         "execution_model": "single-process (air/pyxrt in the lerobot venv)",
-        "npu_stages": ("vision + backbone (experimental)" if NPU_BACKBONE else "vision")
+        "npu_stages": (
+            "vision" + (" + backbone" if NPU_BACKBONE else "") + (" + action expert" if NPU_EXPERT else "")
+            + (" (experimental)" if NPU_BACKBONE or NPU_EXPERT else "")
+        )
         if npu_vision
         else "none (pure CPU)",
     }
@@ -280,7 +287,7 @@ def get_expert_runtime(policy, profile=False):
         bench = str(_HERE / "benchmarking")
         if bench not in sys.path:
             sys.path.insert(0, bench)
-        if os.environ.get("SMOLVLA_NPU_EXPERT_V2", "0") == "1":
+        if NPU_ALL or os.environ.get("SMOLVLA_NPU_EXPERT_V2", "0") == "1":
             # No host K/V packing: a prefix engine + step engine (benchmarking/expert_runtime_v2.py).
             from expert_runtime_v2 import ExpertRuntimeV2 as ExpertRuntime
         else:
@@ -786,6 +793,12 @@ def main() -> int:
         help="EXPERIMENTAL: also run the action expert on the NPU (an all-NPU arm under --profile)",
     )
     ap.add_argument(
+        "--npu-all",
+        action="store_true",
+        help="EXPERIMENTAL: vision + backbone + action expert all on the NPU (implies --npu-backbone "
+        "--npu-expert, expert without host K/V packing); needs the expert engine ELFs, see the README",
+    )
+    ap.add_argument(
         "--input",
         choices=("synthetic", "real"),
         default="synthetic",
@@ -795,6 +808,11 @@ def main() -> int:
     ap.add_argument("--dataset", default="lerobot/droid_100", help="for --input real")
     args = ap.parse_args()
     npu_vision = not args.cpu
+    if args.npu_all:
+        if args.cpu:
+            ap.error("--npu-all and --cpu are opposites")
+        global NPU_ALL, NPU_BACKBONE, NPU_EXPERT
+        NPU_ALL = NPU_BACKBONE = NPU_EXPERT = True
 
     if args.compile_only:
         return compile_only()
