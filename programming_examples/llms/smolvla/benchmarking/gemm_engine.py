@@ -116,6 +116,22 @@ class Job:
     kv: str = None
     kv_off: int = 0
     head_t: int = 0
+    own_passes: int = 1
+    kv_srcs: tuple = ()
+
+    @property
+    def kv_names(self):
+        """The tensors holding the own keys' K|V tiles: one, or one per pass of 64 keys. kv_srcs
+        ((name, column offset), ...) names them one by one, each in the step arena or in the
+        external kv arena (build_gemm_engine's kv_lay); then own_passes == len(kv_srcs)."""
+        if self.kv_srcs:
+            return [n for n, _ in self.kv_srcs]
+        if not self.kv:
+            return []
+        return [self.kv] if self.own_passes == 1 else [f"{self.kv}{p}" for p in range(self.own_passes)]
+
+    def kv_off_at(self, p):
+        return self.kv_srcs[p][1] if self.kv_srcs else self.kv_off
 
     @property
     def n_out(self):
@@ -127,7 +143,7 @@ class Job:
 
     def packed(self, l2_n):
         """(k, n) of packed B: own steps and tiles have none (tile_k_l2 == l2_n)."""
-        return (self.k - l2_n if self.own == "pv" else self.k, self.n - l2_n if self.own == "s" else self.n)
+        return (self.k - self.own_passes * l2_n if self.own == "pv" else self.k, self.n - self.own_passes * l2_n if self.own == "s" else self.n)
 
 
 @dataclass
@@ -167,13 +183,14 @@ class ArenaLayout:
         return np.zeros((self.n_tiles, self.herd_m, self.tile_m, self.l2_n), bfloat16)
 
 
-def arena_layout(m, jobs, tile_m, herd_m, l2_n, pad_tiles=0):
+def arena_layout(m, jobs, tile_m, herd_m, l2_n, pad_tiles=0, external=()):
     """Several jobs may write column windows (c_off) of one C, in column order.
     pad_tiles: unused tiles appended to every herd row (probing arena size effects)."""
     width, produced = {}, list(dict.fromkeys(j.c for j in jobs))
     for j in jobs:
         for name, lo, w in ((j.a, j.a_off, j.k), (j.residual, 0, j.n_out), (j.rope, 0, j.n),
-                            (j.kv, 0, j.kv_off + 2 * l2_n if j.kv else 0), (j.c, j.c_off, j.n_out)):
+                            *[(kv, 0, j.kv_off_at(q) + 2 * l2_n) for q, kv in enumerate(j.kv_names) if kv not in external],
+            (j.c, j.c_off, j.n_out)):
             if name:
                 assert lo % l2_n == 0 and w % l2_n == 0, name
                 width[name] = max(width.get(name, 0), lo + w)
@@ -202,7 +219,8 @@ def weights_layout(jobs, tile_n, tile_k_l2):
 
 
 def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, herd_n, sym_suffix, link_with,
-                      arg_order=None, stack_c=None, arena=None, weights=None, shim_at_launch=False, arena_pad=0):
+                      arg_order=None, stack_c=None, arena=None, weights=None, shim_at_launch=False, arena_pad=0,
+                      kv_arena=None, kv_lay=None):
     """jobs: [Job]. Args are the jobs' named tensors, in arg_order (default:
     first appearance, A, B, residual, C per job).
 
@@ -251,8 +269,10 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
         assert not j.exp or j.residual, "exp's mask rides the residual path"
         assert arena or not (j.a_off or j.c_off)
         assert not j.own or (arena and weights and j.kv), "own K/V ride the weights' B channel from the arena"
-        assert j.own != "s" or (j.k == tk2 == l2_n and j.n > l2_n and j.residual and j.exp)
-        assert j.own != "pv" or (j.div and j.k > tk2 and j.n == 2 * l2_n), "one output tile pair"
+        assert j.own != "s" or (j.k == tk2 == l2_n and j.n >= j.own_passes * l2_n and j.residual and j.exp)
+        assert j.own_passes == 1 or j.own, "own_passes: only own jobs"
+        assert j.own != "pv" or j.k // tk2 >= 3, "own pv with fewer than 3 K steps in total gives wrong results (not understood)"
+        assert j.own != "pv" or (j.div and j.k >= j.own_passes * tk2 and j.n == 2 * l2_n), "one output tile pair"
         if not weights:
             declare(j.b, [j.n // tile_n, j.k // tile_k_l1, tile_bytes], i8)
         if arena:
@@ -266,8 +286,11 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
             declare(j.c, [m, j.n_out], bf16)
     if arena:
         assert not stack_c and tk2 == l2_n, "arena tiles are one tile_k_l2 step wide"
-        lay = arena_layout(m, jobs, tile_m, herd_m, l2_n, arena_pad)
+        lay = arena_layout(m, jobs, tile_m, herd_m, l2_n, arena_pad, external=kv_lay.base if kv_lay else ())
         declare(arena, [lay.n_tiles, herd_m, tile_m, l2_n], bf16)
+        if kv_lay:  # K|V tiles another launch (the prefix engine) produced, in its own arena layout
+            assert kv_arena and kv_arena != arena
+            declare(kv_arena, [kv_lay.n_tiles, herd_m, tile_m, l2_n], bf16)
     if weights:
         wbase, wrows = weights_layout(jobs, tile_n, tk2)
         declare(weights, [wrows, k_per_l2, tile_bytes], i8)
@@ -333,25 +356,36 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
             assert 2 * OWN_VR * OWN_VW == chunk_el and OWN_VR >= tile_m
             tile_el, arena_el = tile_m * l2_n, lay.n_tiles * herd_m * tile_m * l2_n
             arena_flat = T[arena].reshape(arena_el)
+            if kv_lay:
+                kv_el = kv_lay.n_tiles * herd_m * tile_m * l2_n
+                kv_flat = T[kv_arena].reshape(kv_el)
 
-        def own_b(j, c, lj, kc=None):
+        def kv_src(j, q):
+            """Where pass q's K|V tiles of own job j are: (flat view, tensor, tile of its K, flat size)."""
+            nm = j.kv_names[q]
+            if kv_lay and nm in kv_lay.base:
+                return kv_flat, T[kv_arena], kv_lay.base[nm] + j.kv_off_at(q) // l2_n, kv_el
+            return arena_flat, T[arena], lay.base[nm] + j.kv_off_at(q) // l2_n, arena_el
+
+        def own_b(j, c, lj, kc=None, pas=0):
             """Core column c's own-step B, one put (one task, like a weights step: the
             shim zips the channels' task lists): "s", chunk kc; "pv", both chunks."""
-            kv_t = lay.base[j.kv] + j.kv_off // l2_n
             if j.own == "s":
+                flat, _, kv_t, size = kv_src(j, lj - (j.n // l2_n - j.own_passes))
                 # Herd row c's keys: its K tile row-major, padded with what follows.
                 at = (kv_t * herd_m + c) * tile_el
-                assert at + chunk_el <= arena_el
-                return arena_flat[at : at + chunk_el]
+                assert at + chunk_el <= size
+                return flat[at : at + chunk_el]
             # Chunk kc = herd rows 2kc, 2kc+1 (P_own chunk kc's key groups): V rows of each,
             # padded with the rows that follow (the next herd row's), in the kv groups core
             # column c reads. The rows overlap, which no subscript spells: a raw pattern.
             from air.api._index import coerce_index
             from air.api._value import TensorSlice
 
+            _, src, kv_t, size = kv_src(j, pas)
             col0, at = own_pv_col0(j.head_t, c, lj % 2, tile_n, l2_n), (kv_t + 1) * herd_m * tile_el
-            assert at + (herd_m - 1) * tile_el + OWN_VR * l2_n <= arena_el
-            return TensorSlice(T[arena], [coerce_index(0), coerce_index(0), coerce_index(at + col0)],
+            assert at + (herd_m - 1) * tile_el + OWN_VR * l2_n <= size
+            return TensorSlice(src, [coerce_index(0), coerce_index(0), coerce_index(at + col0)],
                                [herd_m, OWN_VR, OWN_VW], [tile_el, l2_n, 1], is_view=True)
 
         drain_before = {}
@@ -362,7 +396,8 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
             start, group, produced_in = lay.drain_lo, 0, set()
             rows = m // l2_m
             for idx, j in enumerate(jobs):
-                if not idx or {j.a, j.residual, j.kv} & produced_in:
+                # repro toggle: ENGINE_SINGLE_DRAIN=1 keeps one drain group for the whole launch
+                if not idx or (not os.environ.get("ENGINE_SINGLE_DRAIN") and {j.a, j.residual, *j.kv_names} & produced_in):
                     group, produced_in = idx, set()
                     drain_before[group] = [start, start]
                 produced_in.add(j.c)
@@ -384,9 +419,11 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                 for li in tile_loop(m // l2_m):
                     for lj in tile_loop(j.n // l2_n):
                         # A "pv" own step is its own A task, pairing with its own B task.
-                        a_steps_j = [(0, j.k // tk2 - 1), (j.k // tk2 - 1, j.k // tk2)] if j.own == "pv" \
-                            else [(0, j.k // tk2)]
-                        for s0, s1 in a_steps_j:
+                        nk_ = j.k // tk2
+                        a_steps_j = [(0, nk_ - j.own_passes)] + [(nk_ - j.own_passes + q, nk_ - j.own_passes + q + 1)
+                                                                  for q in range(j.own_passes)] if j.own == "pv" \
+                            else [(0, nk_)]
+                        for s0, s1 in [h for h in a_steps_j if h[0] < h[1]]:
                             for k2 in air.sequential(s0, s1):
                                 for i in range(herd_m):
                                     if arena:
@@ -406,7 +443,7 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                             assert weights and k_per_l2 == 2
                             for kk in range(k_per_l2):
                                 for c in range(herd_n):
-                                    if j.own == "s" and lj == j.n // l2_n - 1:
+                                    if j.own == "s" and lj >= j.n // l2_n - j.own_passes:
                                         b_in.put(own_b(j, c, lj, kk), indices=[c])
                                         continue
                                     wr = wbase[j.b] + lj * herd_n + c
@@ -425,8 +462,9 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                     else:
                                         b_in.put(B[lj * herd_n + c, kc : kc + k_per_l2, :], indices=[c])
                         if j.own == "pv":
-                            for c in range(herd_n):
-                                b_in.put(own_b(j, c, lj), indices=[c])
+                            for q in range(j.own_passes):
+                                for c in range(herd_n):
+                                    b_in.put(own_b(j, c, lj, pas=q), indices=[c])
                         if j.residual or j.rope:
                             for i in range(herd_m):
                                 a_in.put(act(j.residual or j.rope, li, i, lj), indices=[i])
@@ -578,7 +616,8 @@ def build_gemm_engine(m, jobs, tile_m, tile_n, tile_k_l1, tile_k_l2, herd_m, her
                                         with when(stats):
                                             sumsq(l1_a, ss)
                                     if j.own:
-                                        own = (tix == j.n // l2_n - 1) if j.own == "s" else (ch >= n_ch - k_per_l2)
+                                        own = ((tix == j.n // l2_n - 1 if j.own_passes == 1 else tix >= j.n // l2_n - j.own_passes)
+                                               if j.own == "s" else (ch >= n_ch - j.own_passes * k_per_l2))
                                         own_fn(l1_a, l1_b, acc, 1 if j.own == "s" else 2, own, ch, head[0], ty,
                                                half or 0)
                                     else:
