@@ -167,10 +167,16 @@ are cosine ≥ 0.99 and nMSE ≤ 0.04.
 
 | Input | Cameras | Within threshold | cosine median | cosine worst |
 |---|---|---|---|---|
-| synthetic — **the gate** | 3 | **PASS** | 0.998427 | — |
-| `droid_100`, 100 frames | **3 (shipping)** | **100/100** | 0.999679 | 0.997360 |
-| `droid_100`, 100 frames | 2 | 98/100 | 0.999435 | 0.987832 |
-| `droid_100`, 100 frames | 1 | 97/100 | 0.998840 | 0.957068 |
+| synthetic — **the gate** | 3 | **PASS** | 0.999328 | — |
+| `droid_100`, 100 frames | **3 (shipping)** | **100/100** | 0.999752 | 0.997604 |
+| `droid_100`, 100 frames | 2 | 98/100 | 0.999616 | 0.983156 |
+| `droid_100`, 100 frames | 1 | 97/100 | 0.999142 | 0.893272 |
+
+The experimental all-NPU path (`make verify-all`) passes the same gate at 3, 2 and 1
+cameras and agrees on all 100 real frames at 3 cameras (median cosine 0.999628, worst
+0.996188), but it is slightly less accurate than vision-only and degrades faster with
+fewer cameras (94/100 at 1 camera); see
+[`docs/correctness.md`](docs/correctness.md).
 
 ```bash
 make verify                    # the gate — synthetic, deterministic, PASS/FAIL
