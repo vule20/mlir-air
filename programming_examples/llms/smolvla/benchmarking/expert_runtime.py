@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 from ml_dtypes import bfloat16
 
+from bfp16_rows_pack import pack_rows_bfp16ebs8
 import backbone_npu as bn  # noqa: F401  (sys.path setup)
 import expert_capture as ec
 import expert_engine_probe as xp
@@ -165,10 +166,11 @@ class ExpertRuntime:
             vp[:n_pre] = v
             vals += [kp.transpose(1, 2, 0, 3).reshape(-1, 8),  # [NKV, 8, n_pre, 8]
                      vp.reshape(nk8, 8, xp.NKV, xp.HD).transpose(2, 0, 3, 1).reshape(-1, 8)]  # [NKV, nk8, HD, 8]
-        vals = np.concatenate(vals)
-        pad = -len(vals) % 8
-        packed = self._pack_b(_bf(np.concatenate([vals, np.zeros((pad, 8), np.float32)]).T), 8, 8)
-        self.wts.reshape(-1, REC)[self._dst] = packed.reshape(-1, REC)[self._src]
+        # vals are already bf16-valued, so this is pack_b_bfp16ebs8(vals.T, 8, 8) without its transpose.
+        packed = pack_rows_bfp16ebs8(np.concatenate(vals))
+        # One 9-byte void element per record: a fancy-indexed copy 2.5x faster than 9-column uint8 rows.
+        rec = lambda a: a.reshape(-1, REC).view(f"V{REC}").reshape(-1)  # noqa: E731
+        rec(self.wts)[self._dst] = rec(packed)[self._src]
 
     def _set_prefix(self, k_cache, v_cache, mask, pos):
         """K/V blocks and masks for a prefix: k_cache/v_cache [layers, keys, KV], mask [S, keys + S]."""
