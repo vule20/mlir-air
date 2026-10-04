@@ -523,6 +523,18 @@ void sortPacketShimFlowsByReceiverOrder(
 void reorderL3PacketPutsByFlowOrder(
     AIE::DeviceOp aie_device,
     const std::vector<MemcpyBundleAsFlow> &memcpy_flows);
+// Reject DMA port sharing the switchbox cannot carry, once every channel is
+// allocated. A port is either circuit- or packet-switched, never both. A
+// circuit-switched source port sends everything it streams down every route
+// leaving it, so flows sharing one must go to the same destinations; and a
+// circuit-switched destination port takes one source. Two distinct logical
+// tiles not yet placed may still share a physical tile, so only conflicts that
+// hold wherever they are placed are rejected. Two flows that both carry
+// air.tile_dma_channel may still share a circuit source; the other two rules
+// are hardware limits a pin cannot override.
+LogicalResult
+verifyDmaPortSharing(std::vector<MemcpyBundleAsFlow> &memcpy_flows);
+
 template <typename T>
 int foundInVector(T item, std::vector<T> vec);
 int getSCFForLoopDepth(Operation *o);

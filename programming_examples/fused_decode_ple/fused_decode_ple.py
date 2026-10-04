@@ -275,15 +275,12 @@ _MODELS = {
     # which is why FLM's flag for it is named RTP_GLU_IS_SKIP rather than
     # anything about the MLP. LAYER_CLASS below is that bit plus the s/F bit.
     #
-    # PAD-TO-MAX, for now. M and INTER here are the WIDEST layer's, and the
-    # narrow layers are zero-padded up to them. Zero weights contribute nothing
-    # through either gelu(0)*0 or a zeroed o-proj column, so this is
-    # numerically exact -- it is purely a bandwidth cost, and a real one:
-    # ~2478M weight elements/token against a true 1836M, i.e. +35%. That is far
-    # worse than the 3.6% the lfm2 entry pays for its uniform schedule, so it
-    # is a STAGING decision, not the endpoint. It buys a correct model on the
-    # proven phase machinery; per-class geometry is the optimization after the
-    # numerics gate is green. Do not quote its tok/s as the port's ceiling.
+    # M and INTER here are the WIDEST layer's. Each wave streams only its
+    # class's real weights (see PER_CLASS): no FFN padding on the narrow layers
+    # and no k/v rows on the KV-shared ones. The attention side is still
+    # zero-padded to the full layer's heads; zero weights contribute nothing
+    # through a zeroed o-proj column, so that padding is numerically exact and
+    # costs only bandwidth.
     #
     #   I2P = [M, K, 2*INTER, K]/(ROW_BLOCK*NCX*NCY*PAIR_ROWS)
     #       = [6144, 1536, 24576, 1536]/512 = [12, 3, 48, 3]
@@ -1035,6 +1032,20 @@ DYNSEQ = int(_os.environ.get("DECODE_DYNSEQ", "0"))
 # position the cores are about to read. Named separately only because each one
 # reads better at its use.
 DYNSEQ_RB = DYNSEQ_APPEND = DYNSEQ_RTP = DYNSEQ_MEM = bool(DYNSEQ)
+# DECODE_RT_ROUNDS=1: the attention cores run ceil(L/16) KV blocks, L from their
+# RTP word, instead of all of ATTN_MAXL. The memtile KV ring is count-free and
+# keeps its compile-time bound. Only valid with the host patching the shim
+# readback down to the same block count (DecodeInstsGen's .rb.insts.bin), so the
+# KV traffic follows the context rather than the template.
+RT_ROUNDS = int(_os.environ.get("DECODE_RT_ROUNDS", "0"))
+# DECODE_RT_WINDOW=1 (with DECODE_RT_ROUNDS): a sliding-window wave's cores start
+# at the block the window opens in, and the host starts that wave's readback there
+# (DecodeInstsGen's .sw.insts.bin). DECODE_RB_SWA_SKIP=n moves every sliding
+# wave's readback n blocks later; the host diffs that build to find the words.
+RT_WINDOW = int(_os.environ.get("DECODE_RT_WINDOW", "0"))
+RB_SWA_SKIP = int(_os.environ.get("DECODE_RB_SWA_SKIP", "0"))
+if RT_WINDOW and not RT_ROUNDS:
+    raise SystemExit("DECODE_RT_WINDOW needs DECODE_RT_ROUNDS")
 # DECODE_COALESCE=0: turn off the cross-wave shim-feed coalescing, for A/B.
 COALESCE = int(_os.environ.get("DECODE_COALESCE", "1"))
 # Core stack. At K=4096 (qwen3-8b) the seven K-wide L1 activation buffers leave
@@ -1480,6 +1491,24 @@ assert not KV_SRC or (
 )
 if KV_SRC == list(range(UNI_DEC)):
     KV_SRC = []  # identity: keep the pre-existing offset expression verbatim
+# Which model layer each decode wave computes, for builds that pack layers into
+# waves out of order: the layer gate scores layer 4 alone as wave 0, or layers
+# 14,19 as waves 0,1. The weights are packed on the host and need no map; only
+# the per-layer attention class does, since a sliding-window wave carries its
+# window in the instruction stream. Empty (every model's default) is the
+# identity, which is what a full-depth or prefix build computes.
+WAVE_LAYERS = [
+    int(t) for t in _os.environ.get("DECODE_LAYERS", "").split(",") if t != ""
+] or list(range(UNI_DEC))
+assert len(WAVE_LAYERS) == UNI_DEC, (
+    f"DECODE_LAYERS must name one model layer per decode wave (UNI_DEC="
+    f"{UNI_DEC}): {WAVE_LAYERS}"
+)
+# Decode waves that attend the whole context. Every other decode wave is a
+# sliding-window wave when the model has a window.
+FULL_WAVES = tuple(
+    i for i, l in enumerate(WAVE_LAYERS) if l in MODEL.get("FULL_LAYERS", ())
+)
 UNI_WAVES = UNI_DEC + UNI_LM
 # ATTN_LAYERS indexes DECODE waves, and the unified sequence continues past them
 # into UNI_LM lm-head waves. A SHORT bisect build (DECODE_UNI_DEC below the
@@ -1735,6 +1764,82 @@ NLAYERS = int(_os.environ.get("NLAYERS", "1"))
 # Per-layer DDR slab sizes (elements). LUT is per-position (shared across layers),
 # placed after all NLAYERS rms slabs.
 W_LAYER = sum(NCX * PER_COL_PH[p] * BLOCK_BF16 for p in range(NPH))  # weights / layer
+
+# Per-class geometry. The build is sized for the widest layer; each wave streams
+# only its class's real weights: a NARROW wave (own KV, INTER_NARROW FFN) its
+# real up/gate rounds and down columns, a WIDE wave (KV-shared) its q rows
+# without the k/v rounds. A SLIDING wave's heads are DH_SWA wide in a DH_A slot:
+# its q/k/v rows arrive compact (rope_compute_swa spreads them), and its v sits
+# at the front of the slot, so the attention output has every odd o-proj X
+# block zero and the o-proj streams weights for the even ones only. Everything
+# downstream keeps the build's shape: the projection cores emit zero rounds for
+# rows with no weights and skip X blocks with none. Arm 0 is an LM-head wave.
+PER_CLASS = bool(MODEL.get("INTER_NARROW")) and not HYBRID_MIXER and not LM_HEAD
+# the sliding layout needs rope to know the layer class
+assert PER_CLASS or "DH_SWA" not in MODEL or LM_HEAD, "sliding heads need PER_CLASS"
+SWA_ARM_BIT = 4
+
+
+def arm_of_layer(layer):
+    """The decode arm a model layer's wave carries."""
+    if not PER_CLASS:
+        return 1
+    narrow = layer < MODEL["FIRST_KV_SHARED"]
+    sliding = "DH_SWA" in MODEL and layer not in MODEL["FULL_LAYERS"]
+    return 1 + 2 * narrow + SWA_ARM_BIT * sliding
+
+
+if PER_CLASS:
+    # how many times wider the build's FFN is than a narrow layer's
+    _nf = 2 * J2P[DOWN_PHASE] * COL_BLOCK // MODEL["INTER_NARROW"]
+    assert I2P[GATEUP_PHASE] % _nf == 0 and J2P[DOWN_PHASE] % _nf == 0, (I2P, J2P)
+    _rnd_rows = ROW_BLOCK * NCX * NCY * PAIR_ROWS  # rows per round
+    assert DQ_PADDED % _rnd_rows == 0, DQ_PADDED
+    _sf = DH_A // MODEL.get("DH_SWA", DH_A)  # slot / sliding head
+    assert J2P[OPROJ_PHASE] % _sf == 0 and DQ_PADDED // _sf % _rnd_rows == 0
+    assert M // _sf % _rnd_rows == 0, M
+    CLASS_GEOM = {}
+    for _arm in (1, 3, 5, 7) if "DH_SWA" in MODEL else (1, 3):
+        _narrow, _sliding = _arm & 2, _arm & SWA_ARM_BIT
+        _f = _sf if _sliding else 1
+        # per phase: I2 rounds, J2 X-block pairs, X-block step
+        _i2 = [
+            v // _nf if (_narrow and p == GATEUP_PHASE) else v
+            for p, v in enumerate(I2P)
+        ]
+        _j2 = [
+            v // _nf if (_narrow and p == DOWN_PHASE) else v for p, v in enumerate(J2P)
+        ]
+        _i2[0] = (M if _narrow else DQ_PADDED) // _f // _rnd_rows
+        _j2[OPROJ_PHASE] //= _f
+        _xs = [_f if p == OPROJ_PHASE else 1 for p in range(NPH)]
+        CLASS_GEOM[_arm] = (_i2, _j2, _xs)
+else:
+    CLASS_GEOM = {1: (I2P, J2P, [1] * NPH)}
+DEC_ARMS = tuple(CLASS_GEOM)
+SWA_HEADS = any(a & SWA_ARM_BIT for a in DEC_ARMS)
+
+
+def class_per_col(arm):
+    """Weight blocks one fed column streams in each phase, for an arm."""
+    i2, j2, _ = CLASS_GEOM[arm]
+    return [(i2[p] * PAIR_ROWS * NCY) * 2 * j2[p] for p in range(NPH)]
+
+
+def class_slab(arm):
+    """Packed weight elements of a slab of that arm."""
+    return sum(NCX * n * BLOCK_BF16 for n in class_per_col(arm))
+
+
+def w_layer_of(layer):
+    """Packed weight elements of one model layer's slab."""
+    return class_slab(arm_of_layer(layer)) if PER_CLASS else W_LAYER
+
+
+W_SLABS = [w_layer_of(l) for l in WAVE_LAYERS]
+W_OFFS = [sum(W_SLABS[:w]) for w in range(UNI_DEC)]
+W_DEC = sum(W_SLABS)  # all decode slabs; the LM head follows
+assert not (PER_CLASS and W_SPLIT), "per-class slabs assume one weight buffer"
 RMS_LAYER = N_NORMS * K  # rms weights / layer (2 llama pre-norm / 4 Gemma sandwich)
 KV_LAYER = ATTN_MAXL * KVSZ_TOK  # KV cache / layer
 # ShortConv carried state [BX[t-2] | BX[t-1]] per layer, also in arg4.
@@ -1770,9 +1875,9 @@ def build_module():
         # of the decode phase weights. Separate compile-time size -> decode IR is
         # byte-identical; the device (CDO) is unchanged (only this DDR memref size +
         # the runtime feed differ), so both still share one xclbin.
-        _w_blocks = UNI_DEC * W_TOTAL_BLOCKS + UNI_LM * VOCAB_W_BLOCKS
+        _w_elems = W_DEC + UNI_LM * VOCAB_W_BLOCKS * BLOCK_BF16
         w_l3 = MemRefType.get(
-            [_w_blocks * BLOCK_BF16], bf16
+            [_w_elems], bf16
         )  # packed q4k weights (all phases concatenated), NLAYERS slabs
         # W_SPLIT: w_l3 above stays arg1 and holds GROUP 0; the remaining groups and
         # the lm-head slab are APPENDED after the existing args so every current host
@@ -2015,8 +2120,10 @@ def build_module():
         )
         glu_aie.attributes["link_with"] = StringAttr.get("glu.o")
         # reference rope_compute(q,k,v, qkv, lut): rotate-half RoPE on Q,K (V copied).
+        # A model with sliding heads takes the entry that first spreads a
+        # sliding wave's compact heads into their slots (see CLASS_GEOM).
         rope_compute = FuncOp(
-            "rope_compute",
+            "rope_compute_swa" if SWA_HEADS else "rope_compute",
             ([ropeq_l1, ropekv_l1, ropekv_l1, qkv_l1, ropelut_l1, i32], []),
             visibility="private",
         )
@@ -2450,6 +2557,17 @@ def build_module():
         def idx(v):
             return arith.ConstantOp.create_index(v)
 
+        # The attention RTP-L word carries a sliding window above L: bits 0-19
+        # are L, bits 20-30 the window in units of 16 keys (0 = full attention).
+        # See attn_window_lo() in kernels/aie_kernel_utils.h. Anything that
+        # wants L itself -- a block count -- takes it through here.
+        _RTP_L_MASK = 0xFFFFF
+
+        def _rtp_l(v):
+            return arith.andi(
+                v, arith.ConstantOp(IntegerAttr.get(i32, _RTP_L_MASK), None).result
+            )
+
         def _arm_of_wave(iv, arm):
             """Promote a decode arm to ATTN (2) on the attention waves.
 
@@ -2473,6 +2591,20 @@ def build_module():
             for _k in ATTN_WAVES:
                 arm = arith.select(
                     arith.cmpi(arith.CmpIPredicate.eq, iv, idx(_k)), _a2, arm
+                )
+            return arm
+
+        def _class_arm(iv, arm):
+            """Each decode wave's arm_of_layer, as equality selects over the
+            waves (folded once the wave loop is unrolled)."""
+            if not PER_CLASS or iv is None:
+                return arm
+            for _w, _l in enumerate(WAVE_LAYERS):
+                if arm_of_layer(_l) == 1:
+                    continue
+                _a = arith.ConstantOp(IntegerAttr.get(i32, arm_of_layer(_l)), None)
+                arm = arith.select(
+                    arith.cmpi(arith.CmpIPredicate.eq, iv, idx(_w)), _a.result, arm
                 )
             return arm
 
@@ -2562,6 +2694,63 @@ def build_module():
                 # layer k's res2 is written back to arg0[0], which layer k+1 reads as
                 # its rmsX input.
                 a_iv = _la[-1] if len(_la) > 4 + len(_fa) else None
+
+                # Whether some decode wave carries a window. A build whose waves
+                # are all full-attention layers has none to carry.
+                _WINDOWED = (
+                    bool(MODEL.get("SLIDING_WINDOW", 0))
+                    and a_iv is not None
+                    and len(FULL_WAVES) < UNI_DEC
+                )
+
+                def _attn_L():
+                    """L for the attention herd, with this wave's window packed above it.
+
+                    Sliding-window layers attend only the last SLIDING_WINDOW keys;
+                    the cores mask the ones before the window, and with
+                    DECODE_RT_WINDOW skip the blocks before it. The window is a
+                    constant per wave (the wave loop is fully unrolled by the
+                    shim), so the word is L plus a per-wave constant and
+                    DecodeInstsGen's base + slope * L still reproduces it exactly.
+                    Waves at or past UNI_DEC are lm-head waves and FULL_WAVES
+                    attend everything: both keep L as is.
+                    """
+                    if not _WINDOWED:
+                        return L_rt
+                    sw = MODEL["SLIDING_WINDOW"]
+                    assert sw % 16 == 0 and 0 < sw // 16 < 2048, sw
+                    assert ATTN_MAXL <= _RTP_L_MASK, ATTN_MAXL
+                    _c = lambda v: arith.ConstantOp(
+                        IntegerAttr.get(i32, v), None
+                    ).result
+                    # Without DYNSEQ, L is the build's own ATTN_L -- the word
+                    # DecodeInstsGen patches per token -- rather than a runtime
+                    # argument; the window rides on it the same way.
+                    base = L_rt if DYNSEQ else _c(ATTN_L)
+                    win = _swa_sel(lambda: _c((sw // 16) << 20), lambda: _c(0))
+                    return arith.ori(base, win)
+
+                def _swa_sel(on, off):
+                    """on() on a sliding-window wave, off() on any other."""
+                    v = arith.select(
+                        arith.cmpi(arith.CmpIPredicate.slt, a_iv, idx(UNI_DEC)),
+                        on(),
+                        off(),
+                    )
+                    for _full in FULL_WAVES:
+                        v = arith.select(
+                            arith.cmpi(arith.CmpIPredicate.eq, a_iv, idx(_full)),
+                            off(),
+                            v,
+                        )
+                    return v
+
+                if RB_SWA_SKIP and not _WINDOWED:
+                    raise SystemExit("DECODE_RB_SWA_SKIP needs sliding-window waves")
+
+                # An operand whenever it varies: per dispatch under DYNSEQ, per
+                # wave under a sliding window.
+                L_attn = _attn_L() if (DYNSEQ or _WINDOWED) else None
 
                 # Per-layer offset helpers. a_iv is None (single-layer): plain Python
                 # ints, byte-identical to the original single-layer feeds. a_iv is a
@@ -2716,6 +2905,14 @@ def build_module():
 
                 for _layer in range(NLAYERS if a_iv is None else 1):
                     _wbase = _lb(W_LAYER)  # weights slab for this layer
+                    if PER_CLASS and a_iv is not None:
+                        _wbase = idx(W_OFFS[-1])
+                        for _w in range(UNI_DEC - 2, -1, -1):
+                            _wbase = arith.select(
+                                arith.cmpi(arith.CmpIPredicate.eq, a_iv, idx(_w)),
+                                idx(W_OFFS[_w]),
+                                _wbase,
+                            )
                     _wgi = None  # which weight buffer this decode wave reads
                     if W_SPLIT and a_iv is not None:
                         # Group index and group base, as nested selects over the group
@@ -2764,7 +2961,10 @@ def build_module():
                             _ucmp = arith.cmpi(
                                 arith.CmpIPredicate.slt, a_iv, idx(UNI_DEC)
                             )
-                            _uarm = _arm_of_wave(a_iv, arith.select(_ucmp, _u1, _u0))
+                            _uarm = _class_arm(
+                                a_iv,
+                                _arm_of_wave(a_iv, arith.select(_ucmp, _u1, _u0)),
+                            )
                         _uarm_i = arith.index_cast(idx_t, _uarm)
 
                         def _mix_gate(
@@ -2817,7 +3017,7 @@ def build_module():
                                 )
                             else:
                                 _vwb = arith.addi(
-                                    idx(UNI_DEC * W_LAYER),
+                                    idx(W_DEC),
                                     arith.muli(
                                         arith.subi(a_iv, idx(UNI_DEC)),
                                         idx(VOCAB_W_BLOCKS * BLOCK_BF16),
@@ -3367,6 +3567,19 @@ def build_module():
                                             "compile-time BDs, and the 1-D form folds it "
                                             "into a length the shim cannot recompute."
                                         )
+                                    if RB_SWA_SKIP and (_NRB != 1 or _KV1D):
+                                        raise SystemExit(
+                                            "DECODE_RB_SWA_SKIP needs the single "
+                                            "whole-region 3-D readback"
+                                        )
+                                    # A sliding wave's block count is not a constant
+                                    # until the wave loop unrolls, so keep d0 within
+                                    # the wrap limit rather than have it tiled.
+                                    _run = REGION_W
+                                    if RT_WINDOW and REGION_W >= 1024:
+                                        _run = 512
+                                        assert REGION_W % _run == 0, REGION_W
+                                    _rows = 16 * REGION_W // _run
                                     _ci = 0
                                     while _ci < _nb:
                                         _cb = min(_cbk, _nb - _ci)
@@ -3381,6 +3594,18 @@ def build_module():
                                             if DYNSEQ_RB
                                             else (lambda: idx(_cb))
                                         )
+                                        _rbo = lambda e: _loi(_kbase, e)
+                                        if RB_SWA_SKIP:
+                                            _skb = lambda n: _swa_sel(
+                                                lambda: idx(n), lambda: idx(0)
+                                            )
+                                            _cbv = lambda: arith.subi(
+                                                idx(_cb), _skb(RB_SWA_SKIP)
+                                            )
+                                            _rbo = lambda e: arith.addi(
+                                                _loi(_kbase, e),
+                                                _skb(RB_SWA_SKIP * 16 * REGION_W),
+                                            )
                                         # Contiguous either way; _KV1D just states it as 1-D.
                                         # Spelled inline (not hoisted) so the default path's
                                         # constant emission order -- and thus the emitted IR --
@@ -3390,16 +3615,14 @@ def build_module():
                                                 "inKV_K",
                                                 KVC,
                                                 indices=[idx(gi)],
-                                                offsets=[
-                                                    _loi(_kbase, _kreg_off(gi) + _coff)
-                                                ],
+                                                offsets=[_rbo(_kreg_off(gi) + _coff)],
                                                 sizes=(
                                                     [idx(_cb * 16 * REGION_W)]
                                                     if _KV1D
                                                     else [
                                                         _cbv(),
-                                                        idx(16),
-                                                        idx(REGION_W),
+                                                        idx(_rows),
+                                                        idx(_run),
                                                     ]
                                                 ),
                                                 strides=(
@@ -3407,7 +3630,7 @@ def build_module():
                                                     if _KV1D
                                                     else [
                                                         idx(16 * REGION_W),
-                                                        idx(REGION_W),
+                                                        idx(_run),
                                                         idx(1),
                                                     ]
                                                 ),
@@ -3416,16 +3639,14 @@ def build_module():
                                                 "inKV_V",
                                                 KVC,
                                                 indices=[idx(gi)],
-                                                offsets=[
-                                                    _loi(_kbase, _vreg_off(gi) + _coff)
-                                                ],
+                                                offsets=[_rbo(_vreg_off(gi) + _coff)],
                                                 sizes=(
                                                     [idx(_cb * 16 * REGION_W)]
                                                     if _KV1D
                                                     else [
                                                         _cbv(),
-                                                        idx(16),
-                                                        idx(REGION_W),
+                                                        idx(_rows),
+                                                        idx(_run),
                                                     ]
                                                 ),
                                                 strides=(
@@ -3433,7 +3654,7 @@ def build_module():
                                                     if _KV1D
                                                     else [
                                                         idx(16 * REGION_W),
-                                                        idx(REGION_W),
+                                                        idx(_run),
                                                         idx(1),
                                                     ]
                                                 ),
@@ -3445,6 +3666,8 @@ def build_module():
                             # weight boundary -- append after QKV weights (rope has produced
                             # K/V), barrier, readback, THEN o/up/down weights.
                             woff = 0
+                            # per arm: this phase's (slab offset, blocks per column)
+                            _aoff = {a: 0 for a in DEC_ARMS}
                             for p in range(NPH):
                                 per_col = PER_COL_PH[p]
                                 assert per_col % NCY == 0
@@ -3459,7 +3682,51 @@ def build_module():
                                 # skip coalescing and lose that barrier.
                                 # air-to-aie spatially unrolls this to the per-column feeds.
                                 _wcol0 = _lo(_wbase, woff)  # _wbase + woff (col 0 base)
-                                _feed_wcols(_wcol0, _colspan, per_col // NCY)
+                                if not PER_CLASS:
+                                    _feed_wcols(_wcol0, _colspan, per_col // NCY)
+                                else:
+                                    _feeds = {
+                                        a: (_aoff[a], class_per_col(a)[p])
+                                        for a in DEC_ARMS
+                                    }
+                                    for a, (_o, _pc) in _feeds.items():
+                                        assert _pc % NCY == 0
+                                        _aoff[a] += NCX * _pc * blk
+
+                                    def _feed(f):
+                                        _o, _pc = f
+                                        _feed_wcols(
+                                            _lo(_wbase, _o), _pc * blk, _pc // NCY
+                                        )
+
+                                    # The whole fan in each arm (a switch per column
+                                    # would split the phase barrier), as nested
+                                    # one-case switches.
+                                    def _by_arm(arms):
+                                        a, rest = arms[0], arms[1:]
+                                        if not rest or all(
+                                            _feeds[b] == _feeds[a] for b in rest
+                                        ):
+                                            _feed(_feeds[a])
+                                            return
+
+                                        def _case(op, i, cv):
+                                            _feed(_feeds[a])
+                                            yield_([])
+
+                                        def _other(op):
+                                            _by_arm(rest)
+                                            yield_([])
+
+                                        index_switch(
+                                            [],
+                                            _uarm_i,
+                                            [a],
+                                            case_body_builder=_case,
+                                            default_body_builder=_other,
+                                        )
+
+                                    _by_arm(list(DEC_ARMS))
                                 woff += NCX * per_col * blk
                                 # LAST mixer phase, not the first. The shim is a
                                 # sequential instruction stream: the append blocks
@@ -3614,22 +3881,26 @@ def build_module():
                 # identical flow sets, both of them the ShortConv one. An i32
                 # operand is left alone (this is how DYNSEQ's L already reaches
                 # the attention herd) and survives as a real per-dispatch RTP.
+                # PER_CLASS takes the same route for the projection cores' arm.
                 _seg_arm_rt = (
-                    _arm_of_wave(
+                    _class_arm(
                         a_iv,
-                        arith.select(
-                            arith.cmpi(arith.CmpIPredicate.slt, a_iv, idx(UNI_DEC)),
-                            arith.ConstantOp(IntegerAttr.get(i32, 1), None).result,
-                            arith.ConstantOp(IntegerAttr.get(i32, 0), None).result,
+                        _arm_of_wave(
+                            a_iv,
+                            arith.select(
+                                arith.cmpi(arith.CmpIPredicate.slt, a_iv, idx(UNI_DEC)),
+                                arith.ConstantOp(IntegerAttr.get(i32, 1), None).result,
+                                arith.ConstantOp(IntegerAttr.get(i32, 0), None).result,
+                            ),
                         ),
                     )
-                    if (HYBRID_MIXER and a_iv is not None)
+                    if ((HYBRID_MIXER or PER_CLASS) and a_iv is not None)
                     else None
                 )
                 _seg_opers = (
                     ([a_iv] if a_iv is not None else [])
                     + ([_seg_arm_rt] if _seg_arm_rt is not None else [])
-                    + ([L_rt] if DYNSEQ else [])
+                    + ([L_attn] if L_attn is not None else [])
                 )
 
                 @segment(name="seg", operands=_seg_opers)
@@ -3638,7 +3909,10 @@ def build_module():
                     # The context length reaches the attention herd from here, as a
                     # herd operand: an RTP slot the instruction stream writes per
                     # dispatch, not a constant folded into the core ELF.
-                    _seg_L = _sa[-1] if DYNSEQ else None
+                    # The attention herd's L word (window packed above L), and
+                    # the runtime L itself where there is one.
+                    _seg_Lw = _sa[-1] if L_attn is not None else None
+                    _seg_L = _seg_Lw if DYNSEQ else None
 
                     def _seg_rounds():
                         """ceil(L/16) for the memtile's block dequeue.
@@ -3650,7 +3924,7 @@ def build_module():
                         if not DYNSEQ_MEM:
                             return idx(ATTN_ROUNDS)
                         _s = arith.addi(
-                            _seg_L,
+                            _rtp_l(_seg_L),
                             arith.ConstantOp(IntegerAttr.get(i32, 15), None).result,
                         )
                         _q = arith.divui(
@@ -4075,7 +4349,8 @@ def build_module():
                         # during vocab -> it stalled on the dest0 QKV gets (never
                         # produced in vocab) and never emitted the appendK/appendV
                         # the LM launch waits on -> TIMEOUT.
-                        _arm_rope = _seg_arm
+                        # the class arm: a sliding wave's rope spreads its heads
+                        _arm_rope = _core_arm if PER_CLASS else _seg_arm
 
                         @herd(name="rope", sizes=[1, 1], operands=[_arm_rope])
                         def rope_h(tx, ty, _sx, _sy, _arm):
@@ -4551,8 +4826,8 @@ def build_module():
                                 # the last block. Lh = RTP_L herd operand (kernel masks
                                 # the last partial block). Compute proven in attn_iso.
                                 L_c = (
-                                    _seg_L
-                                    if DYNSEQ_RTP
+                                    _seg_Lw
+                                    if _seg_Lw is not None
                                     else arith.ConstantOp(
                                         IntegerAttr.get(i32, ATTN_L), None
                                     ).result
@@ -4718,10 +4993,10 @@ def build_module():
                                     pushes, which is what keeps the core off a channel get
                                     that never arrives.
                                     """
-                                    if not DYNSEQ_RTP:
+                                    if not (DYNSEQ_RTP or RT_ROUNDS):
                                         return idx(ATTN_ROUNDS)
                                     _s = arith.addi(
-                                        Lh,
+                                        _rtp_l(Lh),
                                         arith.ConstantOp(
                                             IntegerAttr.get(i32, 15), None
                                         ).result,
@@ -4733,6 +5008,29 @@ def build_module():
                                         ).result,
                                     )
                                     return arith.index_cast(idx_t, _q)
+
+                                def _core_first(Lh):
+                                    """attn_window_lo(L) / 16: the block the window opens in.
+
+                                    0 without DECODE_RT_WINDOW, and on any wave whose
+                                    RTP word carries no window.
+                                    """
+                                    if not RT_WINDOW:
+                                        return idx(0)
+                                    _c = lambda v: arith.ConstantOp(
+                                        IntegerAttr.get(i32, v), None
+                                    ).result
+                                    L = _rtp_l(Lh)
+                                    w = arith.andi(arith.shrui(Lh, _c(20)), _c(0x7FF))
+                                    w = arith.shli(w, _c(4))
+                                    _open = arith.andi(
+                                        arith.cmpi(arith.CmpIPredicate.ne, w, _c(0)),
+                                        arith.cmpi(arith.CmpIPredicate.ugt, L, w),
+                                    )
+                                    _lo = arith.shrui(arith.subi(L, w), _c(4))
+                                    return arith.index_cast(
+                                        idx_t, arith.select(_open, _lo, _c(0))
+                                    )
 
                                 def _qk_body(sh, Lh, _c, _arm=None):
                                     a_q = AllocOp(aq_l1, [], [])
@@ -4746,7 +5044,7 @@ def build_module():
                                     # unrollSCFFors only unrolls all-constant loops, so this
                                     # survives to core codegen as a real runtime loop.
                                     _nblk_qk = _core_rounds(Lh)
-                                    for _blk in for_(idx(0), _nblk_qk, idx(1)):
+                                    for _blk in for_(_core_first(Lh), _nblk_qk, idx(1)):
                                         # REQUIRED single-buffer: ping-pong would unroll-by-2 +
                                         # 1-remainder over a 3-buffer toK ring whose remainder reads
                                         # the wrong buffer vs the DMA rotation -> misaligned KV ->
@@ -4775,7 +5073,7 @@ def build_module():
                                     # unrollSCFFors only unrolls all-constant loops, so this
                                     # survives to core codegen as a real runtime loop.
                                     _nblk_qk = _core_rounds(Lh)
-                                    for _blk in for_(idx(0), _nblk_qk, idx(1)):
+                                    for _blk in for_(_core_first(Lh), _nblk_qk, idx(1)):
                                         # REQUIRED single-buffer: ping-pong would unroll-by-2 +
                                         # 1-remainder over a 3-buffer toK ring whose remainder reads
                                         # the wrong buffer vs the DMA rotation -> misaligned KV ->
@@ -4800,7 +5098,7 @@ def build_module():
                                     # RUNTIME-L block count = ceil(Lh/16) (see _qk_body). Core
                                     # loops per RTP-L; matched by the shim readback push count.
                                     _nblk_kv = _core_rounds(Lh)
-                                    for _blk in for_(idx(0), _nblk_kv, idx(1)):
+                                    for _blk in for_(_core_first(Lh), _nblk_kv, idx(1)):
                                         # REQUIRED single-buffer (see _qk_body): keeps toV/toK
                                         # consumption aligned with the DMA rotation (no unroll-by-2
                                         # remainder desync -> no misaligned KV).
@@ -5892,18 +6190,45 @@ def build_module():
                             # writes row 1. See proj_qmm_flush_row.
                             c0i = arith.ConstantOp(IntegerAttr.get(i32, 0), None).result
 
-                            def _gemv(J2v):
+                            def _gemv(J2v, nw=None, xm=None):
                                 J2x2 = arith.muli(J2v, c2)
                                 a_acc = AllocOp(yacc_l1, [], [])
                                 CallOp(zero, [a_acc, _arm])
                                 for _j in for_(idx(0), J2x2, idx(1)):
                                     a_x = AllocOp(xblk_l1, [], [])
                                     ChannelGet("inX", a_x, indices=[gcx, gcy])
-                                    a_w = AllocOp(wblk_l1, [], [])
-                                    ChannelGet("wL2ToL1", a_w, indices=[gcx, gcy])
-                                    CallOp(acc256, [a_x, a_w, a_acc])
+                                    if nw is None:
+                                        a_w = AllocOp(wblk_l1, [], [])
+                                        ChannelGet("wL2ToL1", a_w, indices=[gcx, gcy])
+                                        CallOp(acc256, [a_x, a_w, a_acc])
+                                        DeallocOp(a_w)
+                                    else:
+                                        # Only X blocks j < nw with j & xm == 0
+                                        # carry weights: one get site per channel,
+                                        # the weight half in a 0/1-trip loop.
+                                        _has_w = arith.select(
+                                            arith.andi(
+                                                arith.cmpi(
+                                                    arith.CmpIPredicate.ult, _j, nw
+                                                ),
+                                                arith.cmpi(
+                                                    arith.CmpIPredicate.eq,
+                                                    arith.andi(_j, xm),
+                                                    idx(0),
+                                                ),
+                                            ),
+                                            idx(1),
+                                            idx(0),
+                                        )
+                                        for _w in for_(idx(0), _has_w, idx(1)):
+                                            a_w = AllocOp(wblk_l1, [], [])
+                                            ChannelGet(
+                                                "wL2ToL1", a_w, indices=[gcx, gcy]
+                                            )
+                                            CallOp(acc256, [a_x, a_w, a_acc])
+                                            DeallocOp(a_w)
+                                            yield_([])
                                     DeallocOp(a_x)
-                                    DeallocOp(a_w)
                                     yield_([])
                                 return a_acc
 
@@ -5958,9 +6283,57 @@ def build_module():
                                 pktv = _sel(
                                     _id4, lambda: _psw(_ephv, pktc, idx_t), idx_t
                                 )
+                                if not PER_CLASS:
+                                    for _v1 in for_(idx(0), I2v, idx(1)):
+                                        for _e in range(PAIR_ROWS):  # 1 (non-paired)
+                                            _emit(_gemv(J2v), pktv)
+                                        yield_([])  # v1
+                                    yield_([])  # ph
+                                    continue
+
+                                # Every wave keeps the build's round count and X
+                                # stream. Rounds past its class's I2w have no
+                                # weights; of the X blocks, only every Xs-th of the
+                                # first 2*J2w*Xs has any.
+                                def _per_arm(voc_val, of_arm):
+                                    arms = [a for a in DEC_ARMS if a != 1]
+                                    return index_switch(
+                                        [idx_t],
+                                        _arm_i,
+                                        [0] + arms,
+                                        case_body_builder=lambda op, i, cv: yield_(
+                                            [voc_val if i == 0 else of_arm(arms[i - 1])]
+                                        ),
+                                        default_body_builder=lambda op: yield_(
+                                            [of_arm(1)]
+                                        ),
+                                    )
+
+                                def _tab(k):
+                                    return lambda a: _psw(
+                                        _ephv, [idx(v) for v in CLASS_GEOM[a][k]], idx_t
+                                    )
+
+                                I2w = _per_arm(idx(VOCAB_I2), _tab(0))
+                                J2w = _per_arm(idx(VOCAB_J2), _tab(1))
+                                Xm = _per_arm(
+                                    idx(0),
+                                    lambda a: _psw(
+                                        _ephv,
+                                        [idx(x - 1) for x in CLASS_GEOM[a][2]],
+                                        idx_t,
+                                    ),
+                                )
                                 for _v1 in for_(idx(0), I2v, idx(1)):
+                                    _nw = arith.select(
+                                        arith.cmpi(arith.CmpIPredicate.ult, _v1, I2w),
+                                        arith.muli(
+                                            arith.muli(J2w, c2), arith.addi(Xm, idx(1))
+                                        ),
+                                        idx(0),
+                                    )
                                     for _e in range(PAIR_ROWS):  # 1 (non-paired)
-                                        _emit(_gemv(J2v), pktv)
+                                        _emit(_gemv(J2v, _nw, Xm), pktv)
                                     yield_([])  # v1
                                 yield_([])  # ph
 
@@ -6183,7 +6556,7 @@ def build_module():
 
                         return body
 
-                    _arm_proj = _seg_arm
+                    _arm_proj = _core_arm if PER_CLASS else _seg_arm
                     # Fuse all 16 proj cores into TWO [2,4] block herds: west = logical
                     # cols 0,1 (phys 0,1), east = logical cols 2,3 (phys 6,7). Each block
                     # is a contiguous 2-col x 4-row rectangle. The two blocks cannot merge
