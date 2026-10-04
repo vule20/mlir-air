@@ -71,6 +71,29 @@ sys.modules.setdefault("air_examples", types.ModuleType("air_examples")).__path_
 #                       0 keeps torch's default. The pure-CPU comparison arm always
 #                       keeps torch's default thread count.
 CPU_THREADS = int(os.environ.get("SMOLVLA_CPU_THREADS", "8"))
+# The same cap for numpy's BLAS (the host im2col patch embed, the expert runtimes' matmuls), inside the
+# NPU forward only. It defaults to every hardware thread (32 here); those threads sleep while the NPU
+# runs and wake late, and next to torch's 8 bound threads they oversubscribe the cores: the 3-camera patch
+# embed took 9 ms or 19 ms with a tail to 54 ms, and the whole vision stage 185 ms instead of 160 ms.
+# Needs threadpoolctl (requirements.txt); without it nothing is capped and a warning is printed once.
+
+
+def _blas_limit():
+    from contextlib import nullcontext
+
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        global _WARNED_BLAS
+        if not _WARNED_BLAS:
+            print("[smolvla] threadpoolctl not installed: numpy BLAS threads are not capped "
+                  "(the NPU vision stage runs ~25 ms slower); pip install threadpoolctl")
+            _WARNED_BLAS = True
+        return nullcontext()
+    return threadpool_limits(limits=CPU_THREADS, user_api="blas")
+
+
+_WARNED_BLAS = False
 if os.environ.get("SMOLVLA_CPU_BIND", "1") == "1" and "torch" not in sys.modules:
     os.environ.setdefault("OMP_PROC_BIND", "close")
     os.environ.setdefault("OMP_PLACES", "cores")
@@ -415,7 +438,9 @@ def run_hybrid_forward(
         vwe.forward = _npu_forward
     try:
         policy.reset()
-        with torch.no_grad():
+        from contextlib import nullcontext
+
+        with torch.no_grad(), (_blas_limit() if npu_vision and CPU_THREADS > 0 else nullcontext()):
             chunk = policy.predict_action_chunk(batch, noise=noise)
     finally:
         policy.model.embed_prefix = orig_embed_prefix
